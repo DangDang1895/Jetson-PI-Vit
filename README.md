@@ -162,13 +162,14 @@ Eval-only dependencies are listed in `test_requirements.txt`.
 
 ### 4. Paths and checkpoints
 
-#### Download checkpoints (ModelScope)
+#### Download checkpoints
 
-Pretrained **π₀.₅-LIBERO** + **future correction module** (LIBERO-spatial, step 65000) are hosted on ModelScope:
+Pretrained **π₀.₅-LIBERO** + **future correction module** (LIBERO-spatial, step 65000) are hosted on:
 
-**[zebinyang/Jetson-PI-pi05](https://www.modelscope.cn/models/zebinyang/Jetson-PI-pi05)**
+**Hugging Face: [diantoudefengshan/Jetson-PI-pi05](https://huggingface.co/diantoudefengshan/Jetson-PI-pi05)**
 
-**Hugging Face mirror: [diantoudefengshan/Jetson-PI-pi05](https://huggingface.co/diantoudefengshan/Jetson-PI-pi05)**
+**ModelScope: [zebinyang/Jetson-PI-pi05](https://www.modelscope.cn/models/zebinyang/Jetson-PI-pi05)**
+
 
 ```bash
 pip install modelscope
