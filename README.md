@@ -168,6 +168,8 @@ Pretrained **π₀.₅-LIBERO** + **future correction module** (LIBERO-spatial, 
 
 **[zebinyang/Jetson-PI-pi05](https://www.modelscope.cn/models/zebinyang/Jetson-PI-pi05)**
 
+**Hugging Face mirror: [diantoudefengshan/Jetson-PI-pi05](https://huggingface.co/diantoudefengshan/Jetson-PI-pi05)**
+
 ```bash
 pip install modelscope
 python -c "from modelscope import snapshot_download; snapshot_download('zebinyang/Jetson-PI-pi05', local_dir='./checkpoints/jetson-pi-pi05')"
