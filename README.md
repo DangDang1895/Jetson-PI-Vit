@@ -5,7 +5,7 @@
     <a href="https://www.tlaic.ac.cn/"><img src="media/tlaic-wordmark.svg" alt="Beijing Tongminghu Information Technology Application Innovation Center" width="190" /></a>
   </p>
 
-  <h1>Jetson-PI</h1>
+  <h1>Jetson-PI-VIT</h1>
   <p><strong>Towards Onboard Real-Time Robot Control via Foresight-Aligned Asynchronous Inference</strong></p>
   <p>Foresight-aligned asynchronous inference for responsive, real-time Vision-Language-Action control on edge robots.</p>
 
