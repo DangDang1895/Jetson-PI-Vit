@@ -18,7 +18,11 @@ from openpi.shared import array_typing as at
 
 TokenReducerKind = Literal["learned_cross_attn", "mean_segments", "fixed_query_cross_attn"]
 ActionEncoderKind = Literal["gru", "transformer_block"]
-
+VisualConditionKind = Literal[
+    "residual",
+    "linear_joint",
+    "nonlinear_joint",
+]
 
 @dataclasses.dataclass(frozen=True)
 class Pi0WorldModelConfig:
@@ -35,6 +39,7 @@ class Pi0WorldModelConfig:
     gru_num_layers: int = 2
     gru_inter_layer_dropout: float = 0.1
     action_encoder_kind: ActionEncoderKind = "gru"
+    visual_condition_kind: VisualConditionKind = "residual"
     transformer_num_heads: int = 4
     transformer_ffn_multiplier: int = 4
     proprio_embed_dim: int = 128
@@ -142,6 +147,137 @@ class _MultiHeadAttention(nnx.Module):
         out = jnp.einsum("bhts,bhsc->bhtc", weights, v)
         out = einops.rearrange(out, "b h t c -> b t (h c)")
         return self.w_o(out)
+
+class LatestVisualGlobalCondition(nnx.Module):
+    """将最新视觉 tokens 压缩为全局向量，并生成视觉残差条件。"""
+
+    def __init__(
+        self,
+        cfg: Pi0WorldModelConfig,
+        *,
+        rngs: nnx.Rngs,
+    ):
+        d_vlm = cfg.vlm_hidden_dim
+        d = cfg.token_dim
+
+        # 一个可学习查询，从所有有效视觉 tokens 中提取全局视觉信息。
+        self.visual_query = nnx.Param(
+            jax.random.normal(rngs(), (1, d)) * 0.02
+        )
+
+        # SigLIP token 维度与 WM token 维度不同时进行投影。
+        self.visual_kv_proj = (
+            nnx.Linear(d_vlm, d, rngs=rngs)
+            if d_vlm != d
+            else None
+        )
+
+        self.visual_attention = _MultiHeadAttention(
+            d,
+            cfg.num_future_heads,
+            rngs=rngs,
+        )
+        self.visual_norm = nnx.LayerNorm(
+            d,
+            rngs=rngs,
+        )
+
+        # 零初始化保证模型刚创建时：
+        # delta_u == 0
+        # delta_film == 0
+        # 因而严格退化为原来的 FutureConditionHead。
+        self.visual_u_proj = nnx.Linear(
+            d,
+            d,
+            kernel_init=nnx.initializers.zeros,
+            bias_init=nnx.initializers.zeros,
+            rngs=rngs,
+        )
+        self.visual_film_proj = nnx.Linear(
+            d,
+            2 * d,
+            kernel_init=nnx.initializers.zeros,
+            bias_init=nnx.initializers.zeros,
+            rngs=rngs,
+        )
+
+    def pool_visual(
+        self,
+        latest_visual_tokens: jax.Array,
+        latest_visual_mask: jax.Array,
+    ) -> jax.Array:
+        """将最新视觉 tokens 压缩为一个全局视觉向量 v_latest。"""
+
+        batch_size = latest_visual_tokens.shape[0]
+
+        visual_kv = (
+            latest_visual_tokens
+            if self.visual_kv_proj is None
+            else self.visual_kv_proj(latest_visual_tokens)
+        )
+
+        visual_query = jnp.broadcast_to(
+            self.visual_query.value[None, :, :],
+            (
+                batch_size,
+                self.visual_query.value.shape[0],
+                visual_kv.shape[-1],
+            ),
+        )
+
+        pooled = self.visual_attention(
+            visual_query,
+            visual_kv,
+            latest_visual_mask,
+        )
+        pooled = self.visual_norm(pooled[:, 0, :])
+
+        # 当某个样本不存在有效视觉 token 时，必须返回全零向量。
+        has_valid_visual = jnp.any(
+            latest_visual_mask,
+            axis=-1,
+            keepdims=True,
+        )
+
+        return jnp.where(
+            has_valid_visual,
+            pooled,
+            jnp.zeros_like(pooled),
+        )
+
+    def __call__(
+        self,
+        latest_visual_tokens: jax.Array,
+        latest_visual_mask: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        v_latest = self.pool_visual(
+            latest_visual_tokens,
+            latest_visual_mask,
+        )
+
+        delta_u = self.visual_u_proj(v_latest)
+        delta_film = self.visual_film_proj(v_latest)
+
+        # 即使输出层的 bias 在训练后变为非零，
+        # 没有有效视觉 token 的样本仍必须返回零残差。
+        has_valid_visual = jnp.any(
+            latest_visual_mask,
+            axis=-1,
+            keepdims=True,
+        )
+
+        delta_u = jnp.where(
+            has_valid_visual,
+            delta_u,
+            jnp.zeros_like(delta_u),
+        )
+        delta_film = jnp.where(
+            has_valid_visual,
+            delta_film,
+            jnp.zeros_like(delta_film),
+        )
+
+        return delta_u, delta_film
 
 
 class TokenReducer(nnx.Module):
@@ -401,7 +537,112 @@ class TimeEncoder(nnx.Module):
         x = self.fc1(raw)
         x = nnx.swish(x)
         return self.fc2(x)
+class NonlinearJointCondition(nnx.Module):
+    """非线性联合建模动作、本体、时间和最新视觉条件。"""
 
+    def __init__(
+        self,
+        cfg: Pi0WorldModelConfig,
+        *,
+        rngs: nnx.Rngs,
+    ):
+        d = cfg.token_dim
+        g_dim = (
+            cfg.gru_hidden_dim
+            + cfg.proprio_embed_dim
+            + cfg.time_embed_dim
+        )
+        joint_dim = g_dim + d
+        hidden_dim = 2 * d
+
+        self.joint_norm = nnx.LayerNorm(
+            joint_dim,
+            rngs=rngs,
+        )
+        self.joint_fc1 = nnx.Linear(
+            joint_dim,
+            hidden_dim,
+            rngs=rngs,
+        )
+        self.joint_fc2 = nnx.Linear(
+            hidden_dim,
+            d,
+            rngs=rngs,
+        )
+
+        self.u_head = nnx.Linear(
+            d,
+            d,
+            rngs=rngs,
+        )
+        self.film_head = nnx.Linear(
+            d,
+            2 * d,
+            rngs=rngs,
+        )
+
+    def __call__(
+        self,
+        global_vec: jax.Array,
+        v_latest: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        joint_condition = jnp.concatenate(
+            [global_vec, v_latest],
+            axis=-1,
+        )
+
+        z = self.joint_norm(joint_condition)
+        z = self.joint_fc1(z)
+        z = nnx.swish(z)
+        z = self.joint_fc2(z)
+
+        u = self.u_head(z)
+        film = self.film_head(z)
+
+        return u, film
+    
+class LinearJointCondition(nnx.Module):
+    """使用一次线性映射联合建模 g 与 v_latest。"""
+
+    def __init__(
+        self,
+        cfg: Pi0WorldModelConfig,
+        *,
+        rngs: nnx.Rngs,
+    ):
+        d = cfg.token_dim
+        g_dim = (
+            cfg.gru_hidden_dim
+            + cfg.proprio_embed_dim
+            + cfg.time_embed_dim
+        )
+        joint_dim = g_dim + d
+
+        self.u_proj = nnx.Linear(
+            joint_dim,
+            d,
+            rngs=rngs,
+        )
+        self.film_proj = nnx.Linear(
+            joint_dim,
+            2 * d,
+            rngs=rngs,
+        )
+
+    def __call__(
+        self,
+        global_vec: jax.Array,
+        v_latest: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        joint_condition = jnp.concatenate(
+            [global_vec, v_latest],
+            axis=-1,
+        )
+
+        u = self.u_proj(joint_condition)
+        film = self.film_proj(joint_condition)
+
+        return u, film
 
 class FutureConditionHead(nnx.Module):
 
@@ -414,6 +655,28 @@ class FutureConditionHead(nnx.Module):
         self.block1 = _FutureTokenBlock(d, cfg.num_future_heads, cfg.ffn_multiplier, rngs=rngs)
         self.mean_head = nnx.Linear(d, d, rngs=rngs)
         self.logvar_head = nnx.Linear(d, d, rngs=rngs)
+
+        self.visual_condition_kind = cfg.visual_condition_kind
+
+        if cfg.visual_condition_kind == "residual":
+            self.joint_condition = None
+        elif cfg.visual_condition_kind == "linear_joint":
+            self.joint_condition = LinearJointCondition(
+                cfg,
+                rngs=rngs,
+            )
+        elif cfg.visual_condition_kind == "nonlinear_joint":
+            self.joint_condition = NonlinearJointCondition(
+                cfg,
+                rngs=rngs,
+            )
+        else:
+            raise ValueError(
+                "Unknown visual_condition_kind="
+                f"{cfg.visual_condition_kind!r}. "
+                "Expected one of: residual, linear_joint."
+            )
+
         self.log_var_min = cfg.log_var_min
         self.log_var_max = cfg.log_var_max
 
@@ -422,17 +685,69 @@ class FutureConditionHead(nnx.Module):
         C_t: jax.Array,
         global_vec: jax.Array,
         *,
+        v_latest: jax.Array | None = None,
+        delta_u: jax.Array | None = None,
+        delta_film: jax.Array | None = None,
         detach_features_for_logvar: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
-        u = self.u_proj(global_vec)[:, None, :]
-        film = self.film(global_vec)
-        gamma, beta = jnp.split(film, 2, axis=-1)
-        x = gamma[:, None, :] * (C_t + u) + beta[:, None, :]
+        if self.visual_condition_kind == "residual":
+            u = self.u_proj(global_vec)
+            film = self.film(global_vec)
+
+            if delta_u is not None:
+                u = u + delta_u
+
+            if delta_film is not None:
+                film = film + delta_film
+
+        elif self.visual_condition_kind in (
+            "linear_joint",
+            "nonlinear_joint",
+        ):
+            if v_latest is None:
+                raise ValueError(
+                    f"{self.visual_condition_kind} "
+                    "condition requires v_latest"
+                )
+
+            u, film = self.joint_condition(
+                global_vec,
+                v_latest,
+            )
+
+        else:
+            raise ValueError(
+                "Unknown visual_condition_kind="
+                f"{self.visual_condition_kind!r}"
+            )
+
+        gamma, beta = jnp.split(
+            film,
+            2,
+            axis=-1,
+        )
+
+        x = (
+            gamma[:, None, :]
+            * (C_t + u[:, None, :])
+            + beta[:, None, :]
+        )
+
         x = self.block0(x)
         x = self.block1(x)
         mu = self.mean_head(x)
-        x_lv = jax.lax.stop_gradient(x) if detach_features_for_logvar else x
-        log_var = jnp.clip(self.logvar_head(x_lv), self.log_var_min, self.log_var_max)
+
+        x_lv = (
+            jax.lax.stop_gradient(x)
+            if detach_features_for_logvar
+            else x
+        )
+        log_var = jnp.clip(
+            self.logvar_head(x_lv),
+            self.log_var_min,
+            self.log_var_max,
+        )
+
         return mu, log_var
 
 
@@ -477,6 +792,13 @@ class Pi0FutureWorldModel(nnx.Module):
         self.time_encoder = TimeEncoder(cfg, rngs=rngs)
         self.future_head = FutureConditionHead(cfg, rngs=rngs)
 
+        self.latest_visual_global_condition = (
+            LatestVisualGlobalCondition(
+                cfg,
+                rngs=rngs,
+            )
+        )
+
     def _reduced_to_model_tokens(
         self,
         H: at.Float[at.Array, "b n d_vlm"],
@@ -507,21 +829,112 @@ class Pi0FutureWorldModel(nnx.Module):
         delta_t: at.Float[at.Array, " b"],
         *,
         kv_mask: at.Bool[at.Array, "b n"] | None = None,
+        latest_visual_tokens: at.Float[
+            at.Array,
+            "b v d_vlm",
+        ] | None = None,
+        latest_visual_mask: at.Bool[
+            at.Array,
+            "b v",
+        ] | None = None,
         rngs: nnx.Rngs,
         train: bool = False,
         return_current_tokens: bool = True,
         detach_wm_features_for_logvar: bool = False,
     ) -> WorldModelOutput:
-        C_t = self._reduced_to_model_tokens(H_t, kv_mask=kv_mask)
-        m = self.action_encoder(action_prefix, prefix_mask, rngs=rngs, train=train)
+        # C_t = self._reduced_to_model_tokens(H_t, kv_mask=kv_mask)
+        # m = self.action_encoder(action_prefix, prefix_mask, rngs=rngs, train=train)
+        # p = self.proprio_encoder(proprio)
+        # e = self.time_encoder(delta_t)
+        # g = jnp.concatenate([m, p, e], axis=-1)
+        # mu, log_var = self.future_head(C_t, g, detach_features_for_logvar=detach_wm_features_for_logvar)
+        # return WorldModelOutput(
+        #     mu=mu,
+        #     log_var=log_var,
+        #     current_tokens=C_t if return_current_tokens else None,
+        # )
+        if (latest_visual_tokens is None) != (
+            latest_visual_mask is None
+        ):
+            raise ValueError(
+                "latest_visual_tokens and latest_visual_mask "
+                "must be provided together"
+            )
+        if (
+            self.cfg.visual_condition_kind
+            in (
+                "linear_joint",
+                "nonlinear_joint",
+            )
+            and latest_visual_tokens is None
+        ):
+            raise ValueError(
+                "visual_condition_kind="
+                f"{self.cfg.visual_condition_kind!r} "
+                "requires latest visual inputs"
+            )
+
+        C_t = self._reduced_to_model_tokens(
+            H_t,
+            kv_mask=kv_mask,
+        )
+
+        m = self.action_encoder(
+            action_prefix,
+            prefix_mask,
+            rngs=rngs,
+            train=train,
+        )
         p = self.proprio_encoder(proprio)
         e = self.time_encoder(delta_t)
-        g = jnp.concatenate([m, p, e], axis=-1)
-        mu, log_var = self.future_head(C_t, g, detach_features_for_logvar=detach_wm_features_for_logvar)
+
+        g = jnp.concatenate(
+            [m, p, e],
+            axis=-1,
+        )
+        v_latest = None
+        delta_u = None
+        delta_film = None
+
+        if latest_visual_tokens is not None:
+            if self.cfg.visual_condition_kind == "residual":
+                delta_u, delta_film = (
+                    self.latest_visual_global_condition(
+                        latest_visual_tokens,
+                        latest_visual_mask,
+                    )
+                )
+
+            elif self.cfg.visual_condition_kind in (
+                "linear_joint",
+                "nonlinear_joint",
+            ):
+                v_latest = (
+                    self.latest_visual_global_condition.pool_visual(
+                        latest_visual_tokens,
+                        latest_visual_mask,
+                    )
+                )
+
+        mu, log_var = self.future_head(
+            C_t,
+            g,
+            v_latest=v_latest,
+            delta_u=delta_u,
+            delta_film=delta_film,
+            detach_features_for_logvar=(
+                detach_wm_features_for_logvar
+            ),
+        )
+
         return WorldModelOutput(
             mu=mu,
             log_var=log_var,
-            current_tokens=C_t if return_current_tokens else None,
+            current_tokens=(
+                C_t
+                if return_current_tokens
+                else None
+            ),
         )
 
 
