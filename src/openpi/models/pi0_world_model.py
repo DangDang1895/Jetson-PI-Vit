@@ -937,6 +937,65 @@ class Pi0FutureWorldModel(nnx.Module):
             ),
         )
 
+def initialize_linear_joint_from_legacy_head(
+    model: Pi0FutureWorldModel,
+) -> None:
+    """使用旧版 g-only 条件投影初始化 LinearJointCondition。
+
+    该函数只能在加载不包含 LinearJointCondition 的旧 WM checkpoint
+    后调用一次。恢复已经训练过的 linear-joint checkpoint 时不能调用，
+    否则会把已经学到的视觉权重重新清零。
+    """
+    if model.cfg.visual_condition_kind != "linear_joint":
+        raise ValueError(
+            "legacy linear-joint initialization requires "
+            "visual_condition_kind='linear_joint'"
+        )
+
+    head = model.future_head
+    joint = head.joint_condition
+
+    if not isinstance(joint, LinearJointCondition):
+        raise TypeError(
+            "linear_joint model does not contain "
+            "LinearJointCondition"
+        )
+
+    old_u_kernel = head.u_proj.kernel.value
+    old_film_kernel = head.film.kernel.value
+    visual_dim = model.cfg.token_dim
+
+    # 新联合层输入为 [g, v_latest]。
+    # 前半部分复制旧 g-only 权重，视觉部分初始化为 0。
+    joint.u_proj.kernel.value = jnp.concatenate(
+        [
+            old_u_kernel,
+            jnp.zeros(
+                (visual_dim, old_u_kernel.shape[1]),
+                dtype=old_u_kernel.dtype,
+            ),
+        ],
+        axis=0,
+    )
+    joint.u_proj.bias.value = jnp.array(
+        head.u_proj.bias.value,
+        copy=True,
+    )
+
+    joint.film_proj.kernel.value = jnp.concatenate(
+        [
+            old_film_kernel,
+            jnp.zeros(
+                (visual_dim, old_film_kernel.shape[1]),
+                dtype=old_film_kernel.dtype,
+            ),
+        ],
+        axis=0,
+    )
+    joint.film_proj.bias.value = jnp.array(
+        head.film.bias.value,
+        copy=True,
+    )
 
 def load_pi0_future_world_model(
     checkpoint_dir: str | pathlib.Path,

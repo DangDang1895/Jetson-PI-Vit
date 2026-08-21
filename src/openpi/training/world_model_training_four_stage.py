@@ -184,6 +184,39 @@ def trainable_filter_four_stage2_no_logvar_head() -> nnx.filterlib.Filter:
     """Stage2 variant: do not train variance head (logvar_head)."""
     return nnx.All(trainable_filter_four_stage2(), nnx.Not(nnx_utils.PathRegex(r"wm/.*/logvar_head/.*")))
 
+def trainable_filter_four_stage2_linear_joint_mean(
+) -> nnx.filterlib.Filter:
+    """只训练 linear-joint 模式实际使用的 WM 均值路径。"""
+    return nnx.All(
+        trainable_filter_four_stage2_no_logvar_head(),
+
+        # linear-joint 模式不使用旧的 g-only 投影。
+        nnx.Not(
+            nnx_utils.PathRegex(
+                r"wm/future_head/u_proj/.*"
+            )
+        ),
+        nnx.Not(
+            nnx_utils.PathRegex(
+                r"wm/future_head/film/.*"
+            )
+        ),
+
+        # linear-joint 模式只使用 visual pooling，
+        # 不使用 residual 方案的两个输出投影。
+        nnx.Not(
+            nnx_utils.PathRegex(
+                r"wm/latest_visual_global_condition/"
+                r"visual_u_proj/.*"
+            )
+        ),
+        nnx.Not(
+            nnx_utils.PathRegex(
+                r"wm/latest_visual_global_condition/"
+                r"visual_film_proj/.*"
+            )
+        ),
+    )
 
 def trainable_filter_four_stage3_lcond_wm_no_reducer_lact_pi0(*, full_llm_trainable: bool) -> nnx.filterlib.Filter:
     llm_pat = (
@@ -459,6 +492,24 @@ def run_training(cfg: FourStageWorldModelTrainConfig) -> None:
         resume=cfg.resume,
         max_to_keep=cfg.checkpoint_max_to_keep,
     )
+    init_mode_count = sum(
+        value is not None
+        for value in (
+            cfg.resume_four_stage_orbax_ckpt_root,
+            cfg.resume_wm_export_step,
+            cfg.wm_init_from_export_step,
+            cfg.wm_init_from_checkpoint,
+        )
+    )
+    if init_mode_count > 1:
+        raise ValueError(
+            "resume/init modes are mutually exclusive: "
+            "choose exactly one of "
+            "resume_four_stage_orbax_ckpt_root, "
+            "resume_wm_export_step, "
+            "wm_init_from_export_step, or "
+            "wm_init_from_checkpoint"
+        )
 
     resume_s3_orbax_mngr: ocp.CheckpointManager | None = None
     resume_s3_orbax_step: int | None = None
@@ -556,11 +607,20 @@ def run_training(cfg: FourStageWorldModelTrainConfig) -> None:
         ),
         token_reducer_kind=cfg.token_reducer_kind,
         action_encoder_kind=cfg.action_encoder_kind,
+        visual_condition_kind=cfg.visual_condition_kind,
     )
     logger.info(
-        "Four-stage WM training | token_reducer_kind=%s | action_encoder_kind=%s | stage1_cond=%s | stage1_prefix=%s | lact_prefix=%s | ends @ global_step %s",
+        "Four-stage WM training | "
+        "token_reducer_kind=%s | "
+        "action_encoder_kind=%s | "
+        "visual_condition_kind=%s | "
+        "stage1_cond=%s | "
+        "stage1_prefix=%s | "
+        "lact_prefix=%s | "
+        "ends @ global_step %s",
         cfg.token_reducer_kind,
         cfg.action_encoder_kind,
+        cfg.visual_condition_kind,
         cfg.four_stage1_condition_source,
         cfg.four_stage1_prefix_source,
         cfg.lact_prefix_source,
@@ -623,6 +683,47 @@ def run_training(cfg: FourStageWorldModelTrainConfig) -> None:
         logger.warning(
             "``world_model_step_*`` contains WM only; Pi0 (incl. AE) comes from --pi0-checkpoint."
         )
+    elif cfg.wm_init_from_checkpoint is not None:
+        if cfg.resume:
+            raise ValueError(
+                "wm_init_from_checkpoint starts a new run "
+                "and cannot be combined with --resume"
+            )
+
+        if cfg.stage1_steps != 0:
+            raise ValueError(
+                "wm_init_from_checkpoint requires "
+                "stage1_steps=0"
+            )
+
+        bundle = wm_train.load_bundle_with_wm_checkpoint(
+            bundle,
+            cfg.wm_init_from_checkpoint,
+            initialize_linear_joint_from_legacy=False,
+
+            # initialize_linear_joint_from_legacy=(
+            #     cfg.visual_condition_kind
+            #     == "linear_joint"
+            # ),
+        )
+        params = nnx.state(bundle)
+
+        logger.info(
+            "Loaded legacy WM init from %s | "
+            "visual_condition_kind=%s | "
+            "linear_joint_warm_start=%s",
+            cfg.wm_init_from_checkpoint,
+            cfg.visual_condition_kind,
+            (
+                cfg.visual_condition_kind
+                == "linear_joint"
+            ),
+        )
+        logger.warning(
+            "The checkpoint contains WM parameters only; "
+            "Pi0 and SigLIP still come from "
+            "--pi0-checkpoint."
+        )
 
     if cfg.four_stage1_reducer_only:
         s1_flt = trainable_filter_four_stage1_reducer_only()
@@ -648,10 +749,21 @@ def run_training(cfg: FourStageWorldModelTrainConfig) -> None:
         s3_tag = "four_s3_joint_lcond_lact"
 
     if cfg.wm_logvar_only_finetune:
-        s2_flt = wm_train.trainable_filter_wm_logvar_head_only()
+        s2_flt = (
+            wm_train.trainable_filter_wm_logvar_head_only()
+        )
         s2_tag = "four_s2_wm_logvar_only"
+
+    elif cfg.visual_condition_kind == "linear_joint":
+        s2_flt = (
+            trainable_filter_four_stage2_linear_joint_mean()
+        )
+        s2_tag = "four_s2_linear_joint_mean"
+
     else:
-        s2_flt = trainable_filter_four_stage2_no_logvar_head()
+        s2_flt = (
+            trainable_filter_four_stage2_no_logvar_head()
+        )
         s2_tag = "four_s2_wm_lcond"
 
     stages: list[

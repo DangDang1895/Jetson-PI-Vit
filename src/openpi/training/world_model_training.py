@@ -121,7 +121,31 @@ def load_bundle_with_wm_export(
         )
     loaded_wm = wm_mod.load_pi0_future_world_model(export_dir, config=bundle.wm.cfg)
     return Pi0WorldModelTrainBundle(bundle.pi0, loaded_wm)
+def load_bundle_with_wm_checkpoint(
+    bundle: Pi0WorldModelTrainBundle,
+    checkpoint_dir: str | pathlib.Path,
+    *,
+    initialize_linear_joint_from_legacy: bool,
+) -> Pi0WorldModelTrainBundle:
+    """直接从一个 WM checkpoint 目录加载参数。
 
+    checkpoint_dir 应直接包含 params 子目录，例如：
+    checkpoints/Pretrained/future_correction_module
+    """
+    loaded_wm = wm_mod.load_pi0_future_world_model(
+        checkpoint_dir,
+        config=bundle.wm.cfg,
+    )
+
+    if initialize_linear_joint_from_legacy:
+        wm_mod.initialize_linear_joint_from_legacy_head(
+            loaded_wm
+        )
+
+    return Pi0WorldModelTrainBundle(
+        bundle.pi0,
+        loaded_wm,
+    )
 
 def _resolve_pi0_checkpoint_path(path: str) -> str:
     if path.startswith("gs://") or path.startswith("s3://"):
@@ -263,6 +287,14 @@ def train_step_stage1_no_logvar(
         h_t = jax.lax.stop_gradient(bundle.pi0.prefix_hidden_states(observation_t))
         h_f = jax.lax.stop_gradient(bundle.pi0.prefix_hidden_states(observation_f))
         target = jax.lax.stop_gradient(bundle.wm.reduce_tokens(h_f))
+        latest_visual_tokens, latest_visual_mask = (
+            bundle.pi0.encode_visual_tokens(
+                observation_f
+            )
+        )
+        latest_visual_tokens = jax.lax.stop_gradient(
+            latest_visual_tokens
+        )
         out = bundle.wm(
             h_t,
             observation_t.state,
@@ -270,11 +302,15 @@ def train_step_stage1_no_logvar(
             wm_prefix_mask,
             wm_delta_t,
             kv_mask=None,
+            latest_visual_tokens=latest_visual_tokens,
+            latest_visual_mask=latest_visual_mask,
             rngs=nnx.Rngs(rng_wm),
             train=True,
             return_current_tokens=False,
         )
         log_var_sg = jax.lax.stop_gradient(out.log_var)
+        # 由于我们没有用到logvar，因此这里改成均方误差
+        log_var_sg = jnp.zeros_like(log_var_sg)
         return wm_mod.heteroscedastic_gaussian_nll(target, out.mu, log_var_sg)
 
     diff = nnx.DiffState(0, trainable_filter)
@@ -911,6 +947,7 @@ class WorldModelTrainConfig:
     freeze_token_reducer_stage1: bool = False
     token_reducer_kind: wm_mod.TokenReducerKind = "learned_cross_attn"
     action_encoder_kind: wm_mod.ActionEncoderKind = "gru"
+    visual_condition_kind: wm_mod.VisualConditionKind = "residual"
     # If true, make the entire LLM subtree trainable (not just the *_1 shard).
     full_llm_trainable: bool = False
 
@@ -941,6 +978,7 @@ class WorldModelTrainConfig:
     resume_wm_export_ckpt_root: str | None = None
     wm_init_from_export_step: int | None = None
     wm_init_from_export_ckpt_root: str | None = None
+    wm_init_from_checkpoint: str | None = None
     resume_checkpoint_step: int | None = None
     wandb_enabled: bool = False
     project_name: str = "openpi_world_model"
@@ -1215,6 +1253,7 @@ def run_training(cfg: WorldModelTrainConfig) -> None:
         ),
         token_reducer_kind=cfg.token_reducer_kind,
         action_encoder_kind=cfg.action_encoder_kind,
+        visual_condition_kind=cfg.visual_condition_kind,
     )
     logger.info(
         "World model token_reducer_kind=%s, action_encoder_kind=%s",

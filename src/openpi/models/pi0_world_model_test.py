@@ -638,3 +638,75 @@ def test_nonlinear_joint_condition_requires_latest_visual():
             **inputs,
             rngs=nnx.Rngs(18),
         )
+def test_linear_joint_legacy_warm_start_preserves_base_projection():
+    cfg = dataclasses.replace(
+        _small_config(),
+        visual_condition_kind="linear_joint",
+    )
+    model = wm.Pi0FutureWorldModel(
+        cfg,
+        rngs=nnx.Rngs(19),
+    )
+    head = model.future_head
+
+    global_dim = (
+        cfg.gru_hidden_dim
+        + cfg.proprio_embed_dim
+        + cfg.time_embed_dim
+    )
+
+    global_vec = jnp.linspace(
+        -1.0,
+        1.0,
+        global_dim,
+        dtype=jnp.float32,
+    )[None, :]
+
+    visual_vec = jnp.linspace(
+        1.0,
+        -1.0,
+        cfg.token_dim,
+        dtype=jnp.float32,
+    )[None, :]
+
+    # 旧 FutureConditionHead 的输出。
+    expected_u = head.u_proj(global_vec)
+    expected_film = head.film(global_vec)
+
+    # 将旧投影权重迁移到新的 linear-joint 层。
+    wm.initialize_linear_joint_from_legacy_head(model)
+
+    actual_u, actual_film = head.joint_condition(
+        global_vec,
+        visual_vec,
+    )
+
+    # 视觉权重为零时，新联合层必须保持旧模型输出。
+    np.testing.assert_allclose(
+        actual_u,
+        expected_u,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        actual_film,
+        expected_film,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+    # 新增的视觉权重区域必须全零。
+    np.testing.assert_array_equal(
+        head.joint_condition.u_proj.kernel.value[global_dim:],
+        jnp.zeros(
+            (cfg.token_dim, cfg.token_dim),
+            dtype=head.joint_condition.u_proj.kernel.value.dtype,
+        ),
+    )
+    np.testing.assert_array_equal(
+        head.joint_condition.film_proj.kernel.value[global_dim:],
+        jnp.zeros(
+            (cfg.token_dim, 2 * cfg.token_dim),
+            dtype=head.joint_condition.film_proj.kernel.value.dtype,
+        ),
+    )

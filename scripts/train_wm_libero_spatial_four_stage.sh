@@ -60,6 +60,8 @@ set -o pipefail
   --checkpoint-base-dir "${REPO_ROOT}/checkpoints" \
   --exp-name "${EXP_NAME}" \
   --pi0-checkpoint "${PI0_CHECKPOINT}" \
+  --wm-init-from-checkpoint "${WM_INIT_FROM_CHECKPOINT}" \
+  --visual-condition-kind linear_joint \
   --libero-task-index-min 30 \
   --libero-task-index-max 40 \
   --stage1-steps "${STAGE1_STEPS}" \

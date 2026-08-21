@@ -269,6 +269,56 @@ class Pi0(_model.BaseModel):
         denom = jnp.maximum(jnp.sum(w), 1.0)
         return jnp.sum(per_step * w) / denom
 
+    # 获取O_t的视觉特征
+    @at.typecheck
+    def encode_visual_tokens(
+        self,
+        observation: _model.Observation,
+    ) -> tuple[
+        at.Float[at.Array, "b v d"],
+        at.Bool[at.Array, "b v"],
+    ]:
+        """只使用共享 SigLIP 编码观测图像，不运行大脑 LLM。"""
+        observation = _model.preprocess_observation(
+            None,
+            observation,
+            train=False,
+        )
+
+        visual_tokens = []
+        visual_masks = []
+
+        for name in observation.images:
+            image_tokens, _ = self.PaliGemma.img(
+                observation.images[name],
+                train=False,
+            )
+
+            visual_tokens.append(image_tokens)
+            visual_masks.append(
+                einops.repeat(
+                    observation.image_masks[name],
+                    "b -> b v",
+                    v=image_tokens.shape[1],
+                )
+            )
+
+        if not visual_tokens:
+            raise ValueError(
+                "observation contains no images"
+            )
+
+        return (
+            jnp.concatenate(
+                visual_tokens,
+                axis=1,
+            ),
+            jnp.concatenate(
+                visual_masks,
+                axis=1,
+            ),
+        )
+
     @at.typecheck
     def prefix_hidden_states(self, observation: _model.Observation) -> at.Float[at.Array, "b n d"]:
         """Last-layer prefix hidden states H_t from the VLM stream."""
