@@ -486,6 +486,11 @@ class Args:
     resize_size: int = 224
     action_horizon: int = 5
     async_inference: bool = False
+    async_per_step_cerebellum: bool = False
+    per_step_handover_mode: Literal[
+        "tail_append",
+        "replace_after_one_step",
+    ] = "tail_append"
     async_trigger_step: int = 3
     overlap_skip: int = 0
     async_use_world_model: bool = False
@@ -517,6 +522,26 @@ class Args:
 
 def eval_libero(args: Args) -> None:
     np.random.seed(args.seed)
+
+    if (
+        args.async_per_step_cerebellum
+        and args.async_inference
+    ):
+        raise ValueError(
+            "async_per_step_cerebellum and "
+            "async_inference are separate broker modes; "
+            "do not enable both."
+        )
+
+    if (
+        args.async_per_step_cerebellum
+        and args.action_horizon != 10
+    ):
+        raise ValueError(
+            "The first per-step cerebellum version "
+            "requires action_horizon=10, got "
+            f"{args.action_horizon}."
+        )
 
     if args.async_use_world_model and not args.async_inference:
         raise ValueError("async_use_world_model=True requires async_inference=True")
@@ -624,9 +649,25 @@ def eval_libero(args: Args) -> None:
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
 
-    env_holder: dict = {"env": None, "task_description": ""}
+    env_holder: dict = {
+        "env": None,
+        "task_description": "",
+    }
     proprio_chunk_idx = None
-    if args.async_inference:
+
+    if args.async_per_step_cerebellum:
+        chunk_policy = (
+            action_chunk_broker.PerStepCerebellumBroker(
+                policy=client,
+                action_horizon=args.action_horizon,
+                async_key=OPENPI_ASYNC_KEY,
+                handover_mode=(
+                    args.per_step_handover_mode
+                ),
+            )
+        )
+
+    elif args.async_inference:
         if args.async_use_proprio_state_at_h_minus_k:
             proprio_chunk_idx = args.action_horizon - args.async_trigger_step
         elif args.async_proprio_state_chunk_index is not None:
@@ -880,7 +921,7 @@ def eval_libero(args: Args) -> None:
     finally:
         if isinstance(
             chunk_policy,
-            (action_chunk_broker.AsyncActionChunkBroker, action_chunk_broker.AsyncActionBufferBroker),
+            (action_chunk_broker.AsyncActionChunkBroker, action_chunk_broker.AsyncActionBufferBroker,action_chunk_broker.PerStepCerebellumBroker),
         ):
             chunk_policy.shutdown()
 

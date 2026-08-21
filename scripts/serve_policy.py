@@ -25,6 +25,7 @@ try:
         ActionEncoderKind,
         Pi0WorldModelConfig,
         TokenReducerKind,
+        VisualConditionKind,
         load_pi0_future_world_model,
     )
 except ImportError:
@@ -32,6 +33,7 @@ except ImportError:
     load_pi0_future_world_model = None
     TokenReducerKind = str
     ActionEncoderKind = str
+    VisualConditionKind = str
 
 
 class EnvMode(enum.Enum):
@@ -81,6 +83,17 @@ class Args:
     world_model_checkpoint: str | None = None
     world_model_token_reducer_kind: TokenReducerKind = "learned_cross_attn"
     world_model_action_encoder_kind: ActionEncoderKind = "gru"
+    world_model_visual_condition_kind: VisualConditionKind = "residual"
+
+    world_model_num_reducer_heads: int = 4
+    world_model_num_future_heads: int = 4
+    world_model_gru_hidden_dim: int = 256
+    world_model_gru_num_layers: int = 2
+    world_model_transformer_num_heads: int = 4
+    world_model_transformer_ffn_multiplier: int = 4
+
+
+
     async_ae_proprio_source: Literal["prefix_t", "future_rollout", "vlash_last_action"] = "vlash_last_action"
 
 
@@ -211,18 +224,48 @@ def create_policy(args: Args) -> _policy.Policy:
             )
         else:
             wm_dir = download.maybe_download(args.world_model_checkpoint)
+            # wm_cfg = Pi0WorldModelConfig(
+            #     proprio_dim=train_cfg.model.action_dim,
+            #     action_dim=train_cfg.model.action_dim,
+            #     token_reducer_kind=args.world_model_token_reducer_kind,
+            #     action_encoder_kind=args.world_model_action_encoder_kind,
+            # )
             wm_cfg = Pi0WorldModelConfig(
                 proprio_dim=train_cfg.model.action_dim,
                 action_dim=train_cfg.model.action_dim,
-                token_reducer_kind=args.world_model_token_reducer_kind,
-                action_encoder_kind=args.world_model_action_encoder_kind,
+                token_reducer_kind=(
+                    args.world_model_token_reducer_kind
+                ),
+                action_encoder_kind=(
+                    args.world_model_action_encoder_kind
+                ),
+                visual_condition_kind=(
+                    args.world_model_visual_condition_kind
+                ),
+                num_reducer_heads=(
+                    args.world_model_num_reducer_heads
+                ),
+                num_future_heads=(
+                    args.world_model_num_future_heads
+                ),
+                gru_hidden_dim=(
+                    args.world_model_gru_hidden_dim
+                ),
+                gru_num_layers=(
+                    args.world_model_gru_num_layers
+                ),
+                transformer_num_heads=(
+                    args.world_model_transformer_num_heads
+                ),
+                transformer_ffn_multiplier=(
+                    args.world_model_transformer_ffn_multiplier
+                ),
             )
             wm = load_pi0_future_world_model(wm_dir, config=wm_cfg)
             logging.info(
-                "Loaded world model from %s (token_reducer_kind=%s, action_encoder_kind=%s)",
+                "Loaded world model from %s with config=%s",
                 wm_dir,
-                args.world_model_token_reducer_kind,
-                args.world_model_action_encoder_kind,
+                wm_cfg,
             )
 
     return _async_policy.Pi0AsyncInferencePolicy(

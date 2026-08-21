@@ -1,6 +1,8 @@
 # ruff: noqa: SLF001, RUF002, RUF003
 from __future__ import annotations
 
+import concurrent.futures
+import dataclasses
 import logging
 import time
 from typing import Any, Literal
@@ -63,6 +65,19 @@ class _LowKappaFullPi0Fallback(Exception):
 ASYNC_KEY = "openpi/async"
 AeProprioSource = Literal["prefix_t", "future_rollout", "vlash_last_action"]
 
+PER_STEP_ACTION_PREFIX_LEN = 10
+
+
+@dataclasses.dataclass(frozen=True)
+class _BrainSnapshot:
+    """一次已经完成并可供小脑读取的大脑快照。"""
+
+    episode_id: int
+    source_step: int
+    h_t: jax.Array
+    prefix_mask: jax.Array
+    kv_cache: Any
+    proprio: jax.Array
 
 def _rollforward_proprio_batched(state: jnp.ndarray, actions: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
     m = mask.astype(jnp.float32)[..., None]
@@ -111,6 +126,24 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
         self._ae_proprio_source: AeProprioSource = ae_proprio_source
         self._prefix_states = nnx_utils.module_jit(pi0.prefix_hidden_states)
         self._sample_with_future = nnx_utils.module_jit(pi0.sample_actions)
+
+        # 当前观测只执行一次共享 SigLIP。
+        self._latest_visual = nnx_utils.module_jit(
+            pi0.encode_visual_tokens
+        )
+
+        # 大脑复用共享 SigLIP 输出，生成 H 和 KV。
+        self._build_brain_cache = nnx_utils.module_jit(
+            pi0.prefix_hidden_states_and_kv_from_visual
+        )
+
+        # 小脑使用旧 Snapshot 中缓存的 KV 去噪。
+        self._sample_with_cached_kv = nnx_utils.module_jit(
+            pi0.sample_actions_from_cached_kv
+        )
+
+
+
         if world_model is not None:
             wm_gd, wm_st = nnx.split(world_model)
 
@@ -129,19 +162,588 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
                 )
                 kappa = global_confidence_from_log_var(out.log_var)
                 return out.mu, kappa
+            def _wm_visual_jitted(
+                h_t,
+                proprio,
+                action_prefix_pad,
+                prefix_mask,
+                delta_t,
+                latest_visual_tokens,
+                latest_visual_mask,
+                rng_key,
+            ):
+                wm = nnx.merge(
+                    wm_gd,
+                    wm_st,
+                )
+
+                out = wm(
+                    h_t,
+                    proprio,
+                    action_prefix_pad,
+                    prefix_mask,
+                    delta_t,
+                    kv_mask=None,
+                    latest_visual_tokens=(
+                        latest_visual_tokens
+                    ),
+                    latest_visual_mask=(
+                        latest_visual_mask
+                    ),
+                    rngs=nnx.Rngs(rng_key),
+                    train=False,
+                    return_current_tokens=False,
+                )
+
+                return out.mu
+
+            self._wm_forward_visual = jax.jit(
+                _wm_visual_jitted
+            )
 
             self._wm_forward = jax.jit(_wm_jitted)
         else:
             self._wm_forward = None
+            self._wm_forward_visual = None
+
+        # 单线程后台大脑。避免多个大脑任务排队。
+        self._brain_executor = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="openpi-brain",
+            )
+        )
+
+        self._brain_future: (
+            concurrent.futures.Future[_BrainSnapshot] | None
+        ) = None
+
+        self._brain_snapshot: _BrainSnapshot | None = None
+        self._per_step_episode_id: int | None = None
+
+        # key 是实际执行动作的控制步：
+        # history[k] 表示从 O_k 到 O_{k+1} 执行的动作 a_k。
+        self._executed_action_history: dict[
+            int,
+            np.ndarray,
+        ] = {}
 
     @property
     def metadata(self) -> dict[str, Any]:
         return self._inner.metadata
 
+    def _build_brain_snapshot_task(
+        self,
+        *,
+        episode_id: int,
+        source_step: int,
+        observation: _model.Observation,
+        visual_tokens: jax.Array,
+        visual_mask: jax.Array,
+        proprio: jax.Array,
+    ) -> _BrainSnapshot:
+        """后台大脑：从共享视觉继续生成 H/KV。"""
+
+        h_t, prefix_mask, kv_cache = (
+            self._build_brain_cache(
+                observation,
+                visual_tokens,
+                visual_mask,
+            )
+        )
+
+        # JAX 默认异步派发。必须等待设备计算完成，
+        # Future.done() 才能真正表示 H/KV 已经可用。
+        h_t = jax.block_until_ready(h_t)
+        prefix_mask = jax.block_until_ready(
+            prefix_mask
+        )
+        kv_cache = jax.tree.map(
+            jax.block_until_ready,
+            kv_cache,
+        )
+        proprio = jax.block_until_ready(proprio)
+
+        return _BrainSnapshot(
+            episode_id=episode_id,
+            source_step=source_step,
+            h_t=h_t,
+            prefix_mask=prefix_mask,
+            kv_cache=kv_cache,
+            proprio=proprio,
+        )
+
+    def _publish_finished_brain_snapshot(
+        self,
+    ) -> None:
+        future = self._brain_future
+
+        if future is None or not future.done():
+            return
+
+        self._brain_future = None
+        snapshot = future.result()
+
+        if snapshot.episode_id != self._per_step_episode_id:
+            logger.info(
+                "Discard stale brain snapshot: "
+                "episode=%d source_step=%d",
+                snapshot.episode_id,
+                snapshot.source_step,
+            )
+            return
+
+        current = self._brain_snapshot
+        if (
+            current is not None
+            and snapshot.source_step
+            <= current.source_step
+        ):
+            return
+
+        self._brain_snapshot = snapshot
+
+        logger.info(
+            "Published brain snapshot: "
+            "episode=%d source_step=%d",
+            snapshot.episode_id,
+            snapshot.source_step,
+        )
+
+    def _start_brain_update(
+        self,
+        *,
+        episode_id: int,
+        source_step: int,
+        observation: _model.Observation,
+        visual_tokens: jax.Array,
+        visual_mask: jax.Array,
+        proprio: jax.Array,
+    ) -> None:
+        if self._brain_future is not None:
+            return
+
+        self._brain_future = self._brain_executor.submit(
+            self._build_brain_snapshot_task,
+            episode_id=episode_id,
+            source_step=source_step,
+            observation=observation,
+            visual_tokens=visual_tokens,
+            visual_mask=visual_mask,
+            proprio=proprio,
+        )
+
+    def _reset_per_step_state(
+        self,
+        episode_id: int,
+    ) -> None:
+        # episode 切换发生频率低，可以在这里等待旧任务退出，
+        # 避免旧 episode 的大脑任务占用后台 worker。
+        if self._brain_future is not None:
+            try:
+                self._brain_future.result(
+                    timeout=600
+                )
+            except Exception:
+                logger.exception(
+                    "Previous brain update failed "
+                    "during episode reset."
+                )
+
+        self._brain_future = None
+        self._brain_snapshot = None
+        self._executed_action_history.clear()
+        self._per_step_episode_id = episode_id
+
+        logger.info(
+            "Reset per-step cerebellum state: "
+            "episode=%d",
+            episode_id,
+        )
+
+    def _build_fixed_action_prefix(
+        self,
+        *,
+        snapshot: _BrainSnapshot,
+        current_step: int,
+    ) -> tuple[
+        jax.Array,
+        jax.Array,
+        jax.Array,
+    ]:
+        """构造从 Snapshot_s 到当前 O_t 的固定长度动作前缀。"""
+
+        delta_steps = (
+            current_step - snapshot.source_step
+        )
+
+        if delta_steps < 1:
+            raise ValueError(
+                "Per-step WM requires current_step > "
+                "snapshot.source_step, got "
+                f"current_step={current_step}, "
+                f"source_step={snapshot.source_step}."
+            )
+
+        if delta_steps > PER_STEP_ACTION_PREFIX_LEN:
+            raise ValueError(
+                "Per-step WM snapshot exceeds the trained "
+                "action-prefix range: "
+                f"delta_steps={delta_steps}, "
+                f"max={PER_STEP_ACTION_PREFIX_LEN}."
+            )
+
+        missing_steps = [
+            step
+            for step in range(
+                snapshot.source_step,
+                current_step,
+            )
+            if step not in self._executed_action_history
+        ]
+
+        if missing_steps:
+            raise ValueError(
+                "Missing actually executed actions for "
+                f"steps={missing_steps}."
+            )
+
+        raw_actions = np.stack(
+            [
+                self._executed_action_history[step]
+                for step in range(
+                    snapshot.source_step,
+                    current_step,
+                )
+            ],
+            axis=0,
+        ).astype(
+            np.float32,
+            copy=False,
+        )
+
+        if self._action_norm is not None:
+            raw_actions = self._action_norm(
+                {
+                    "actions": raw_actions,
+                }
+            )["actions"]
+
+        model_actions = transforms.pad_to_dim(
+            raw_actions,
+            self._model_action_dim,
+            axis=-1,
+        )
+        model_actions = np.asarray(
+            model_actions,
+            dtype=np.float32,
+        )
+
+        action_prefix_pad = np.zeros(
+            (
+                PER_STEP_ACTION_PREFIX_LEN,
+                self._model_action_dim,
+            ),
+            dtype=np.float32,
+        )
+        action_prefix_pad[:delta_steps] = (
+            model_actions
+        )
+
+        prefix_mask = np.zeros(
+            (
+                PER_STEP_ACTION_PREFIX_LEN,
+            ),
+            dtype=bool,
+        )
+        prefix_mask[:delta_steps] = True
+
+        return (
+            jnp.asarray(
+                action_prefix_pad
+            )[np.newaxis, ...],
+            jnp.asarray(
+                prefix_mask
+            )[np.newaxis, ...],
+            jnp.asarray(
+                [float(delta_steps)],
+                dtype=jnp.float32,
+            ),
+        )
+
+    def _infer_per_step_cerebellum(
+        self,
+        inputs: dict,
+        meta: dict,
+    ) -> dict:
+        if self._wm_forward_visual is None:
+            raise RuntimeError(
+                "Per-step cerebellum requires a loaded "
+                "world model."
+            )
+
+        episode_id = int(meta["episode_id"])
+        current_step = int(meta["control_step"])
+
+        if current_step < 0:
+            raise ValueError(
+                "control_step must be non-negative."
+            )
+
+        if episode_id != self._per_step_episode_id:
+            self._reset_per_step_state(
+                episode_id
+            )
+
+        # O_t 到达时，a_{t-1} 已经执行完成。
+        if current_step > 0:
+            last_action = meta.get(
+                "last_executed_action"
+            )
+            if last_action is None:
+                raise ValueError(
+                    "Per-step request with control_step > 0 "
+                    "requires last_executed_action."
+                )
+
+            self._executed_action_history[
+                current_step - 1
+            ] = np.asarray(
+                last_action,
+                dtype=np.float32,
+            ).reshape(-1).copy()
+
+        # 如果上一次后台大脑已经完成，在本轮小脑读取前发布。
+        self._publish_finished_brain_snapshot()
+
+        batched = jax.tree.map(
+            lambda x: jnp.asarray(x)[
+                np.newaxis,
+                ...
+            ],
+            inputs,
+        )
+        observation = _model.Observation.from_dict(
+            batched
+        )
+
+        # 当前 O_t 只执行一次共享 SigLIP。
+        latest_visual_tokens, latest_visual_mask = (
+            self._latest_visual(
+                observation
+            )
+        )
+
+        t0 = time.monotonic()
+
+        # 初始 episode：缓存为空，等待正常大脑产生
+        # H_0/KV_0，并直接用它生成第一块正常 Pi0 动作。
+        if self._brain_snapshot is None:
+            snapshot = self._build_brain_snapshot_task(
+                episode_id=episode_id,
+                source_step=current_step,
+                observation=observation,
+                visual_tokens=latest_visual_tokens,
+                visual_mask=latest_visual_mask,
+                proprio=batched["state"],
+            )
+            self._brain_snapshot = snapshot
+
+            self._inner._rng, k_sample = (
+                jax.random.split(
+                    self._inner._rng,
+                    2,
+                )
+            )
+
+            actions_batched = (
+                self._sample_with_cached_kv(
+                    k_sample,
+                    observation,
+                    cached_kv_cache=(
+                        snapshot.kv_cache
+                    ),
+                    cached_prefix_mask=(
+                        snapshot.prefix_mask
+                    ),
+                    num_steps=(
+                        self._inner._sample_kwargs.get(
+                            "num_steps",
+                            10,
+                        )
+                    ),
+                    future_condition_tokens=None,
+                )
+            )
+
+            used_snapshot = snapshot
+            delta_steps = 0
+            initial_full_pi0 = True
+
+        else:
+            # 本轮小脑固定读取当前已经完成的快照。
+            used_snapshot = self._brain_snapshot
+
+            if used_snapshot.source_step >= current_step:
+                raise ValueError(
+                    "Per-step snapshot must be older than "
+                    "the current observation after the "
+                    "initial request: "
+                    f"source_step={used_snapshot.source_step}, "
+                    f"current_step={current_step}."
+                )
+
+            # 当前视觉产生后，后台大脑也使用相同视觉
+            # 计算 H_t/KV_t；小脑不等待它。
+            self._start_brain_update(
+                episode_id=episode_id,
+                source_step=current_step,
+                observation=observation,
+                visual_tokens=latest_visual_tokens,
+                visual_mask=latest_visual_mask,
+                proprio=batched["state"],
+            )
+
+            (
+                action_prefix_pad,
+                action_prefix_mask,
+                delta_t,
+            ) = self._build_fixed_action_prefix(
+                snapshot=used_snapshot,
+                current_step=current_step,
+            )
+
+            delta_steps = int(
+                current_step
+                - used_snapshot.source_step
+            )
+
+            self._inner._rng, k_wm, k_sample = (
+                jax.random.split(
+                    self._inner._rng,
+                    3,
+                )
+            )
+
+            mu_t = self._wm_forward_visual(
+                used_snapshot.h_t,
+                used_snapshot.proprio,
+                action_prefix_pad,
+                action_prefix_mask,
+                delta_t,
+                latest_visual_tokens,
+                latest_visual_mask,
+                k_wm,
+            )
+
+            actions_batched = (
+                self._sample_with_cached_kv(
+                    k_sample,
+                    observation,
+                    cached_kv_cache=(
+                        used_snapshot.kv_cache
+                    ),
+                    cached_prefix_mask=(
+                        used_snapshot.prefix_mask
+                    ),
+                    num_steps=(
+                        self._inner._sample_kwargs.get(
+                            "num_steps",
+                            10,
+                        )
+                    ),
+                    future_condition_tokens=mu_t,
+                )
+            )
+
+            initial_full_pi0 = False
+
+        actions_batched = jax.block_until_ready(
+            actions_batched
+        )
+
+        outputs = {
+            "state": batched["state"],
+            "actions": actions_batched,
+        }
+        outputs = jax.tree.map(
+            lambda x: np.asarray(
+                x[0, ...]
+            ),
+            outputs,
+        )
+        outputs = self._inner._output_transform(
+            outputs
+        )
+
+        outputs["policy_timing"] = {
+            "infer_ms": (
+                time.monotonic() - t0
+            )
+            * 1000,
+        }
+        outputs[
+            "openpi/per_step_cerebellum"
+        ] = True
+        outputs[
+            "openpi/per_step_initial_full_pi0"
+        ] = initial_full_pi0
+        outputs[
+            "openpi/brain_snapshot_source_step"
+        ] = int(used_snapshot.source_step)
+        outputs[
+            "openpi/current_control_step"
+        ] = current_step
+        outputs[
+            "openpi/wm_delta_steps"
+        ] = delta_steps
+
+        logger.info(
+            "per_step_cerebellum: "
+            "episode=%d current_step=%d "
+            "snapshot_source_step=%d "
+            "delta_steps=%d initial=%s "
+            "brain_update_running=%s",
+            episode_id,
+            current_step,
+            used_snapshot.source_step,
+            delta_steps,
+            initial_full_pi0,
+            self._brain_future is not None,
+        )
+
+        return outputs
+
     @override
     def infer(self, obs: dict) -> dict:
         d = dict(obs)
         meta = d.pop(ASYNC_KEY, None)
+
+        if (
+            isinstance(meta, dict)
+            and meta.get(
+                "per_step_cerebellum"
+            )
+        ):
+            if (
+                self._world_model is None
+                or self._wm_forward_visual is None
+            ):
+                raise RuntimeError(
+                    "per_step_cerebellum requested "
+                    "without a loaded world model."
+                )
+
+            inputs = self._inner._input_transform(
+                d
+            )
+
+            return self._infer_per_step_cerebellum(
+                inputs,
+                meta,
+            )
+
+
         if not isinstance(meta, dict) or not meta.get("use_world_model"):
             return self._inner.infer(d)
         if self._wm_forward is None or self._world_model is None:

@@ -9,7 +9,7 @@ from typing import Dict, Optional
 
 import numpy as np
 import tree
-from typing_extensions import override
+from typing_extensions import Literal, override
 
 from openpi_client import base_policy as _base_policy
 
@@ -299,6 +299,294 @@ def _split_leading_horizon(full: Dict, H: int) -> list[Dict]:  # noqa: UP006
 
     return [one(i) for i in range(H)]
 
+class PerStepCerebellumBroker(
+    _base_policy.BasePolicy
+):
+    """每执行一步触发一次小脑推理，并按 Jetson-PI 方式补充动作尾部。"""
+
+    def __init__(
+        self,
+        policy: _base_policy.BasePolicy,
+        action_horizon: int,
+        *,
+        async_key: str = "openpi/async",
+        handover_mode: Literal[
+            "tail_append",
+            "replace_after_one_step",
+        ] = "tail_append",
+    ) -> None:
+        if action_horizon < 2:
+            raise ValueError(
+                "action_horizon must be at least 2."
+            )
+        if handover_mode not in (
+            "tail_append",
+            "replace_after_one_step",
+        ):
+            raise ValueError(
+                "Unknown per-step handover_mode="
+                f"{handover_mode!r}. Expected "
+                "'tail_append' or "
+                "'replace_after_one_step'."
+            )
+
+        self._policy = policy
+        self._action_horizon = int(action_horizon)
+        self._async_key = async_key
+        self._handover_mode = handover_mode
+
+        self._buf: deque[Dict] = deque()
+        self._pending_future: (
+            concurrent.futures.Future | None
+        ) = None
+        self._pending_control_step: int | None = None
+
+        self._executor = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=1
+            )
+        )
+
+        self._episode_id = -1
+        self._control_step = 0
+        self._last_executed_action: (
+            np.ndarray | None
+        ) = None
+
+    def _build_request(
+        self,
+        obs: Dict,
+    ) -> Dict:
+        request = _snapshot_observation(obs)
+
+        meta = {
+            "per_step_cerebellum": True,
+            "episode_id": self._episode_id,
+            "control_step": self._control_step,
+        }
+
+        if self._control_step > 0:
+            if self._last_executed_action is None:
+                raise RuntimeError(
+                    "Missing last_executed_action for "
+                    f"control_step={self._control_step}."
+                )
+
+            meta["last_executed_action"] = np.array(
+                self._last_executed_action,
+                dtype=np.float32,
+                copy=True,
+            )
+
+        request[self._async_key] = meta
+        return request
+
+    def _validate_full(
+        self,
+        full: Dict,
+    ) -> None:
+        if "actions" not in full:
+            raise RuntimeError(
+                "Policy output does not contain actions."
+            )
+
+        actions = np.asarray(full["actions"])
+
+        if (
+            actions.ndim < 1
+            or actions.shape[0]
+            != self._action_horizon
+        ):
+            raise RuntimeError(
+                "Expected an action chunk with leading "
+                f"horizon={self._action_horizon}, "
+                f"got shape={actions.shape}."
+            )
+
+    def _accept_initial_chunk(
+        self,
+        full: Dict,
+    ) -> None:
+        self._validate_full(full)
+
+        parts = _split_leading_horizon(
+            full,
+            self._action_horizon,
+        )
+        self._buf.extend(parts)
+
+    def _accept_handover_result(
+        self,
+        full: Dict,
+    ) -> None:
+        self._validate_full(full)
+
+        if self._pending_control_step is not None:
+            returned_step = full.get(
+                "openpi/current_control_step"
+            )
+
+            if returned_step is not None:
+                returned_step = int(
+                    np.asarray(returned_step).reshape(())
+                )
+
+                if (
+                    returned_step
+                    != self._pending_control_step
+                ):
+                    raise RuntimeError(
+                        "Per-step response is out of order: "
+                        f"expected control_step="
+                        f"{self._pending_control_step}, "
+                        f"got {returned_step}."
+                    )
+
+        # parts = _split_leading_horizon(
+        #     full,
+        #     self._action_horizon,
+        # )
+
+        # # 固定一控制步推理延迟，并沿用 Jetson-PI：
+        # # 保留旧 buffer，只补充新动作块最后一个动作。
+        # self._buf.append(parts[-1])
+
+        parts = _split_leading_horizon(
+            full,
+            self._action_horizon,
+        )
+
+        if self._handover_mode == "tail_append":
+            # Jetson-PI 稳定性基线：
+            # 保留旧 buffer，只补充新动作块最后一步。
+            self._buf.append(parts[-1])
+
+        elif (
+            self._handover_mode
+            == "replace_after_one_step"
+        ):
+            # 请求期间已经执行了一步旧动作。
+            # 新动作块的第 0 项对应已经过去的时刻，
+            # 因此丢弃第 0 项，并让第 1 项立即接管。
+            self._buf.clear()
+            self._buf.extend(parts[1:])
+
+    def _consume_pending(self) -> None:
+        if self._pending_future is None:
+            return
+
+        full = self._pending_future.result(
+            timeout=600
+        )
+
+        self._pending_future = None
+        self._accept_handover_result(full)
+        self._pending_control_step = None
+
+    def _start_per_step_infer(
+        self,
+        obs: Dict,
+    ) -> None:
+        if self._pending_future is not None:
+            raise RuntimeError(
+                "A per-step inference request is "
+                "already running."
+            )
+
+        request = self._build_request(obs)
+        self._pending_control_step = (
+            self._control_step
+        )
+        self._pending_future = (
+            self._executor.submit(
+                self._policy.infer,
+                request,
+            )
+        )
+
+    @override
+    def infer(
+        self,
+        obs: Dict,
+    ) -> Dict:
+        # 上一步启动的小脑推理应当在当前控制步接管前完成。
+        self._consume_pending()
+
+        if self._control_step == 0:
+            # 初始缓存为空，第一次请求同步产生
+            # H0/KV0 和完整的正常 Pi0 动作块。
+            initial_request = self._build_request(obs)
+            initial_full = self._policy.infer(
+                initial_request
+            )
+            self._accept_initial_chunk(
+                initial_full
+            )
+        else:
+            # O_t 到达后启动小脑推理；随后返回旧 buffer
+            # 中当前要执行的动作，实现推理与 env.step 重叠。
+            self._start_per_step_infer(obs)
+
+        if not self._buf:
+            raise RuntimeError(
+                "Per-step action buffer is empty."
+            )
+
+        out = self._buf.popleft()
+
+        if "actions" not in out:
+            raise RuntimeError(
+                "Per-step output does not contain actions."
+            )
+
+        # 这是客户端接下来真正交给环境执行的动作。
+        # 下一次请求将它作为 a_{t} 发送给服务端。
+        self._last_executed_action = np.array(
+            out["actions"],
+            dtype=np.float32,
+            copy=True,
+        ).reshape(-1)
+
+        self._control_step += 1
+        return out
+
+    @override
+    def reset(self) -> None:
+        if self._pending_future is not None:
+            try:
+                self._pending_future.result(
+                    timeout=600
+                )
+            except Exception:
+                logger.exception(
+                    "Pending per-step inference failed "
+                    "during reset."
+                )
+
+        self._pending_future = None
+        self._pending_control_step = None
+        self._buf.clear()
+
+        self._episode_id += 1
+        self._control_step = 0
+        self._last_executed_action = None
+
+        self._policy.reset()
+
+    def shutdown(self) -> None:
+        if self._pending_future is not None:
+            try:
+                self._pending_future.result(
+                    timeout=600
+                )
+            except Exception:
+                logger.exception(
+                    "Pending per-step inference failed "
+                    "during shutdown."
+                )
+
+        self._pending_future = None
+        self._executor.shutdown(wait=False)
 
 class AsyncActionBufferBroker(_base_policy.BasePolicy):
 

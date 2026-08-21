@@ -40,8 +40,15 @@ export LIBERO_WM_EVAL_NO_WM=0
 
 # Async chunking: H=10, trigger at K, overlap = H-K
 export AH="${AH:-10}"
-export K="${K:-9}"
-export OVERLAP="${OVERLAP:-$((AH - K))}"
+export LIBERO_WM_EVAL_PER_STEP_CEREBELLUM="${LIBERO_WM_EVAL_PER_STEP_CEREBELLUM:-0}"
+
+if [[ "${LIBERO_WM_EVAL_PER_STEP_CEREBELLUM}" == "1" ]]; then
+  export K="${K:-1}"
+  export OVERLAP="${OVERLAP:-$((AH - 1))}"
+else
+  export K="${K:-9}"
+  export OVERLAP="${OVERLAP:-$((AH - K))}"
+fi
 
 if [[ -z "${WM:-}" ]]; then
   : "${EXP_NAME:?Set WM (e.g. PATH/TO/future-correction-module) or EXP_NAME + STEP}"
@@ -83,4 +90,4 @@ if [[ "${LIBERO_WM_EVAL_ADAPTIVE_KAPPA:-0}" == "1" ]]; then
   export LIBERO_WM_EVAL_EXTRA_TYRO="--async-wm-multi-rollout --async-wm-multi-rollout-adaptive-kappa --async-wm-multi-rollout-adaptive-kappa-low-replan --async-wm-rollout-delta-t ${DELTA}.0 --async-wm-multi-rollout-kappa-delta=${KAPPA_DELTA} --wm-confidence-jsonl ${LIBERO_WM_EVAL_OUT_ROOT}/wm_confidence.jsonl"
 fi
 
-exec bash "${REPO_ROOT}/scripts/libero_wm_eval_spatial_bundle_step_one.sh"
+exec bash "${REPO_ROOT}/scripts/libero_wm_eval_spatial_bundle_step_one_vit.sh"
