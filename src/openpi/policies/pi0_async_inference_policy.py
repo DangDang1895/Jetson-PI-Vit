@@ -301,6 +301,13 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
         ):
             return
 
+        # # 大脑推理延迟=9
+        # if (
+        #     current is not None
+        #     and snapshot.source_step - current.source_step < 9
+        # ):
+        #     return
+
         self._brain_snapshot = snapshot
 
         logger.info(

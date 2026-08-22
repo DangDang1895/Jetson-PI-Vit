@@ -1,330 +1,415 @@
-<div align="center">
-  <p>
-    <a href="https://www.pku.edu.cn/"><img src="media/pku-wordmark-red.png" alt="Peking University" width="300" /></a>
-    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-    <a href="https://www.tlaic.ac.cn/"><img src="media/tlaic-wordmark.svg" alt="Beijing Tongminghu Information Technology Application Innovation Center" width="190" /></a>
-  </p>
+# Jetson-PI-ViT
 
-  <h1>Jetson-PI-VIT</h1>
-  <p><strong>Towards Onboard Real-Time Robot Control via Foresight-Aligned Asynchronous Inference</strong></p>
-  <p>Foresight-aligned asynchronous inference for responsive, real-time Vision-Language-Action control on edge robots.</p>
+_华南理工大学研究分支：面向“最新视觉条件 + 大小脑异步推理”的机器人 VLA 实验平台_
 
-  <p>
-    <a href="https://arxiv.org/abs/2607.12659"><img src="https://img.shields.io/badge/arXiv-2607.12659-b31b1b.svg" alt="arXiv" /></a>
-    <a href="https://github.com/PKU-SEC-Lab/Jetson-PI"><img src="https://img.shields.io/badge/Code-Jetson--PI-35b8a9.svg" alt="Jetson-PI code" /></a>
-    <a href="https://www.modelscope.cn/models/zebinyang/Jetson-PI-pi05"><img src="https://img.shields.io/badge/Model-Jetson--PI--pi05-624AFF.svg" alt="Jetson-PI pi05 model" /></a>
-    <a href="https://github.com/PKU-SEC-Lab/Jetson-PI-Edge"><img src="https://img.shields.io/badge/Runtime-Jetson--PI--Edge-3578c8.svg" alt="Jetson-PI-Edge runtime" /></a>
-    <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-f28c45.svg" alt="Apache-2.0 license" /></a>
-  </p>
+[![Affiliation](https://img.shields.io/badge/Affiliation-SCUT-005BAC.svg)](https://www.scut.edu.cn/)
+[![Research status](https://img.shields.io/badge/Status-Research%20Prototype-f59e0b.svg)](#-当前状态)
+[![Upstream](https://img.shields.io/badge/Upstream-Jetson--PI-35b8a9.svg)](https://github.com/PKU-SEC-Lab/Jetson-PI)
+[![License](https://img.shields.io/badge/License-Apache--2.0-f28c45.svg)](LICENSE)
 
-  <p>
-    <a href="https://arxiv.org/abs/2607.12659">Paper</a> ·
-    <a href="#real-world-demo">Demo</a> ·
-    <a href="#results-on-libero-π₀₅">Results</a> ·
-    <a href="#training">Training</a> ·
-    <a href="#evaluation">Evaluation</a> ·
-    <a href="https://github.com/PKU-SEC-Lab/Jetson-PI-Edge">Edge Runtime</a> ·
-    <a href="#citation">Citation</a>
-  </p>
-</div>
+> **项目归属说明：** 本仓库由华南理工大学研究人员维护，是基于上游
+> [Jetson-PI](https://github.com/PKU-SEC-Lab/Jetson-PI) 的研究分支，并非
+> Jetson-PI 官方仓库。Jetson-PI 论文、原始方法、模型与实验结果归原作者所有；
+> 本分支只对新增的最新视觉条件、训练逻辑和异步推理系统负责。
 
----
+本项目研究一个直接的问题：既然小脑侧的视觉编码和未来纠正模块比完整大脑推理更轻量，能否让小脑在每个控制步读取最新图像，使用最近可用的 `H/KV` 大脑快照及时生成动作，同时由大脑在后台持续更新快照？
 
-## Overview
+当前主线使用 `linear_joint` 最新视觉条件。它把已执行动作、本体状态、时间间隔和最新 SigLIP 视觉表示联合编码，用于预测当前时刻的去噪条件 `mu`。当前实现不依赖置信度门控；旧的自适应 `kappa`/multi-rollout 路径仍保留用于兼容和对照，但不属于每步小脑主流程。
 
-This repository is the official implementation of:
+## 📋 项目重点
 
-> **[Jetson-PI: Towards Onboard Real-Time Robot Control via Foresight-Aligned Asynchronous Inference](https://arxiv.org/abs/2607.12659)**<br>
-> Zebin Yang, Qi Wang, Yunhe Wang, Xiurui Guo, Bo Yu, Shaoshan Liu, Jiafeng Xu, Hao Dong, and Meng Li.<br>
-> arXiv:2607.12659, 2026.
+相对上游 Jetson-PI，本分支的主要改动如下：
 
-Vision-Language-Action (VLA) models have achieved impressive performance on diverse embodied tasks, yet deploying them on low-power onboard devices such as NVIDIA Jetson Orin remains challenging due to high inference latency and limited compute. Asynchronous inference can partially mask this latency, but it introduces **prediction–execution misalignment** and **long reaction time**. Jetson-PI addresses both through **Foresight-Aligned Asynchronous Correction (FAAC)**: we train a lightweight **future correction module** that predicts **future environment representation** conditioned on committed actions, enabling the **action expert** to directly predict actions from the future time step; we further introduce **confidence-based scheduling optimization** that adaptively balances VLM and action expert invocations.
+| 方向 | 当前实现 |
+| --- | --- |
+| 最新视觉条件 | 共享 Pi0 中的 SigLIP，每个控制步只编码一次当前观测图像 |
+| 条件融合 | `linear_joint([m, p, e, v_latest])` 联合产生内容偏置和 FiLM 参数 |
+| 训练对齐 | `H_(t-delta)`、已执行动作和 `O_t` 共同预测当前压缩特征 `C_t` |
+| 异步大脑 | 后台从当前视觉继续计算新的 `H_t/KV_t`，完成后原子发布快照 |
+| 每步小脑 | 每执行一个控制步触发一次小脑请求，不等待正在运行的大脑更新 |
+| KV 复用 | 小脑使用与 `H_s` 同源的 `KV_s` 去噪，避免混用不同快照 |
+| 动作交接 | 支持 `tail_append` 与 `replace_after_one_step` 两种实验模式 |
+| 当前主配置 | `Pi0.5 + LIBERO-spatial + H=10 + K=1 + linear_joint` |
 
-This release open-sources **LIBERO training and evaluation code** built on **π₀.₅**. The accelerated **llama.cpp**-based onboard inference engine is available in [PKU-SEC-Lab/Jetson-PI-Edge](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge).
+更详细的设计与训练定义见：
 
-## Real-world Demo
+- [`docs/2026-08-20-latest-visual-global-condition-design.md`](docs/2026-08-20-latest-visual-global-condition-design.md)
+- [`docs/2026-08-20-latest-visual-joint-condition-design.md`](docs/2026-08-20-latest-visual-joint-condition-design.md)
+- [`docs/2026-08-21-latest-visual-linear-joint-training-logic.md`](docs/2026-08-21-latest-visual-linear-joint-training-logic.md)
 
-<p align="center">
-  <img src="./video/demo.gif" alt="Real-world demo" width="720"/>
-</p>
+## 🧠 方法概览
 
-<p align="center">
-  <a href="./video/demo.mp4">▶ Full video (mp4)</a>
-</p>
+### 训练时间对齐
 
-## Results on LIBERO (π₀.₅)
+定义机器人动力学时间关系：
 
-Success rate comparison across four LIBERO sub-datasets. We report SR of Foresight-Aligned Asynchronous Correction alone (**Ours**) and with Confidence-based Scheduling Optimization (**+Sched**). Inference time of the action expert is estimated as $\Delta_{ae}=\lceil\Delta/3\rceil$, a common ratio on both high-end GPUs (e.g. RTX 4090) and onboard GPUs (e.g. Orin). We train **one model** for all $\Delta$ values.
+```text
+O_k --a_k--> O_(k+1)
+```
 
-<div align="center">
+对当前时刻 `t` 随机采样 `delta >= 1`，训练样本使用：
 
-<table>
-<thead>
-<tr>
-  <th></th>
-  <th colspan="4">SPATIAL</th>
-  <th colspan="4">OBJECT</th>
-  <th colspan="4">GOAL</th>
-  <th colspan="4">LIBERO-10</th>
-</tr>
-<tr>
-  <th>Sync.</th>
-  <th colspan="4">97.3</th>
-  <th colspan="4">99.6</th>
-  <th colspan="4">96.7</th>
-  <th colspan="4">93.5</th>
-</tr>
-<tr>
-  <th>Δ</th>
-  <th>VLASH</th><th>RTC</th><th>Ours</th><th>+Sched</th>
-  <th>VLASH</th><th>RTC</th><th>Ours</th><th>+Sched</th>
-  <th>VLASH</th><th>RTC</th><th>Ours</th><th>+Sched</th>
-  <th>VLASH</th><th>RTC</th><th>Ours</th><th>+Sched</th>
-</tr>
-</thead>
-<tbody>
-<tr><td>1</td><td>98.8</td><td>97.1</td><td>97.7</td><td>98.6</td><td>99.2</td><td>98.5</td><td>98.7</td><td>98.8</td><td>96.7</td><td>96.5</td><td>97.0</td><td>97.5</td><td>94.4</td><td>92.3</td><td>93.4</td><td>93.1</td></tr>
-<tr><td>2</td><td>97.5</td><td>95.4</td><td>97.1</td><td>97.6</td><td>99.2</td><td>98.5</td><td>98.5</td><td>99.3</td><td>97.0</td><td>96.0</td><td>96.2</td><td>97.3</td><td>94.6</td><td>92.1</td><td>92.7</td><td>92.9</td></tr>
-<tr><td>3</td><td>94.4</td><td>94.5</td><td>97.1</td><td>97.2</td><td>98.8</td><td>96.4</td><td>98.2</td><td>98.4</td><td>93.3</td><td>94.3</td><td>96.7</td><td>96.4</td><td>91.9</td><td>89.6</td><td>91.3</td><td>91.9</td></tr>
-<tr><td>4</td><td>92.5</td><td>92.5</td><td>96.7</td><td>96.9</td><td>96.9</td><td>97.7</td><td>97.8</td><td>98.9</td><td>93.3</td><td>93.3</td><td>95.9</td><td>96.9</td><td>89.6</td><td>85.8</td><td>91.8</td><td>92.3</td></tr>
-<tr><td>5</td><td>84.3</td><td>91.2</td><td>95.9</td><td>96.7</td><td>94.3</td><td>96.9</td><td>96.9</td><td>98.6</td><td>89.9</td><td>93.9</td><td>96.0</td><td>96.1</td><td>80.3</td><td>83.6</td><td>91.5</td><td>92.0</td></tr>
-<tr><td>6</td><td>74.4</td><td>91.7</td><td>97.0</td><td>97.5</td><td>88.5</td><td>97.4</td><td>98.3</td><td>98.4</td><td>81.3</td><td>94.0</td><td>96.7</td><td>96.9</td><td>78.5</td><td>84.6</td><td>92.2</td><td>92.9</td></tr>
-<tr><td>7</td><td>51.3</td><td>91.7</td><td>97.0</td><td>97.3</td><td>81.4</td><td>97.1</td><td>98.0</td><td>98.4</td><td>76.1</td><td>92.6</td><td>97.1</td><td>97.2</td><td>77.0</td><td>85.3</td><td>92.6</td><td>92.6</td></tr>
-<tr><td>8</td><td>46.7</td><td>90.9</td><td>97.2</td><td>97.5</td><td>65.1</td><td>93.8</td><td>98.3</td><td>98.8</td><td>70.8</td><td>93.4</td><td>96.8</td><td>96.8</td><td>65.5</td><td>83.2</td><td>92.3</td><td>92.7</td></tr>
-<tr><td>9</td><td>30.1</td><td>88.8</td><td>97.0</td><td>97.3</td><td>51.7</td><td>93.1</td><td>97.5</td><td>97.6</td><td>59.7</td><td>92.5</td><td>96.3</td><td>96.5</td><td>59.6</td><td>81.0</td><td>92.0</td><td>92.2</td></tr>
-<tr>
-  <td><b>Avg</b></td>
-  <td>74.4</td><td>92.6</td><td>97.0</td><td><b>97.4</b></td>
-  <td>86.1</td><td>96.6</td><td>98.0</td><td><b>98.6</b></td>
-  <td>84.2</td><td>94.1</td><td>96.5</td><td><b>96.8</b></td>
-  <td>81.3</td><td>86.4</td><td>92.2</td><td><b>92.5</b></td>
-</tr>
-</tbody>
-</table>
+```text
+源观测：      O_(t-delta)
+旧大脑特征：  H_(t-delta)
+源本体状态：  q_(t-delta)
+已执行动作：  [a_(t-delta), ..., a_(t-1)]
+最新视觉：    V_t = SigLIP(O_t.images)
+监督目标：    C_t = TokenReducer(H_t)
+```
 
-</div>
+未来纠正模块学习：
 
----
+```text
+WM(H_(t-delta), q_(t-delta), actions[t-delta:t], delta, V_t)
+    -> mu_t ~= C_t
+```
 
-## Requirements
+动作前缀长度严格等于 `delta`，不包含 `a_t`，因为 `a_t` 会把 `O_t` 推进到 `O_(t+1)`。
 
-| Item | Recommendation |
-|------|----------------|
-| OS | Ubuntu 22.04 |
-| GPU | NVIDIA GPU with **≥ 48 GB** VRAM for full three-stage training (batch 16) |
-| Python | **3.11** for training (`uv` / JAX) |
-| CUDA | CUDA 12.x (installed via project dependencies; no system CUDA required) |
+```mermaid
+flowchart LR
+    accTitle: Latest Visual Training Flow
+    accDescr: Training uses an old brain state, the actions executed since that state, and current visual tokens to predict the current reduced brain condition.
 
----
+    source_obs["Source O_(t-delta)"] --> old_brain["Brain H_(t-delta)"]
+    executed_actions["Executed actions to t"] --> action_encoder["Encode action prefix"]
+    current_obs["Current O_t"] --> latest_visual["Shared SigLIP V_t"]
+    current_obs --> target_brain["Frozen brain H_t"]
+    target_brain --> target_tokens["Frozen target C_t"]
+    old_brain --> world_model["Future correction module"]
+    action_encoder --> world_model
+    latest_visual --> world_model
+    world_model --> predicted_mu["Predicted mu_t"]
+    predicted_mu --> loss["Half mean squared error"]
+    target_tokens --> loss
 
-## Environment Setup
+    classDef source fill:#f3f4f6,stroke:#6b7280,stroke-width:2px,color:#1f2937
+    classDef process fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#1e3a5f
+    classDef target fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d
 
-### 1. Clone and submodules
+    class source_obs,executed_actions,current_obs source
+    class old_brain,action_encoder,latest_visual,target_brain,world_model process
+    class target_tokens,predicted_mu,loss target
+```
+
+### `linear_joint` 条件
+
+非视觉条件和最新视觉首先分别编码：
+
+```text
+m = ActionEncoder(executed_actions, prefix_mask)
+p = ProprioEncoder(q_source)
+e = TimeEncoder(delta)
+v = VisualPooling(SigLIP(O_t.images), visual_mask)
+```
+
+然后联合生成演化条件：
+
+```text
+g_joint = concat([m, p, e, v])
+u        = joint_u_proj(g_joint)
+film     = joint_film_proj(g_joint)
+mu       = FutureTokenBlocks(C_source, u, film)
+```
+
+最新图像只通过未来纠正模块影响 `mu`。去噪阶段继续使用与旧大脑特征同源的缓存 `KV`，不会把最新图像再次作为新的大脑前缀输入。
+
+### 每步异步推理
+
+初始请求同步产生 `H_0/KV_0` 和第一块正常 Pi0 动作。之后每个控制步共享一次当前 SigLIP 视觉编码：小脑立即读取最近已经完成的快照，后台大脑同时尝试从同一视觉输入更新下一份快照。
+
+```mermaid
+sequenceDiagram
+    accTitle: Per-Step Cerebellum Inference
+    accDescr: Each control step shares one SigLIP encoding between a fast cerebellum path using the latest completed brain snapshot and a background brain update.
+
+    participant client as Robot client
+    participant siglip as Shared SigLIP
+    participant cerebellum as Cerebellum
+    participant snapshot as H/KV snapshot
+    participant brain as Background brain
+
+    client->>siglip: Send initial O_0
+    siglip->>brain: Provide V_0
+    brain->>snapshot: Publish H_0 and KV_0
+    snapshot-->>cerebellum: Read fresh snapshot
+    cerebellum-->>client: Return initial Pi0 chunk
+
+    loop Every control step t >= 1
+        client->>siglip: Send O_t and last action
+        siglip-->>cerebellum: Provide latest V_t
+        snapshot-->>cerebellum: Read H_s, KV_s, q_s
+        cerebellum->>cerebellum: Evolve mu_t from actions s to t
+        cerebellum-->>client: Denoise and return action chunk
+        siglip->>brain: Start H_t and KV_t update
+        brain->>snapshot: Apply publish policy when complete
+    end
+```
+
+服务端会记录从快照源步 `s` 到当前控制步 `t` 之间真正执行的动作，并构造固定长度前缀：
+
+```text
+action_prefix = [a_s, ..., a_(t-1)]
+delta_steps   = t - s
+```
+
+`H_s`、`KV_s`、`q_s` 必须来自同一快照。若后台大脑尚未完成，小脑继续使用旧快照，但视觉仍更新为当前 `O_t`。
+
+### 动作交接模式
+
+| 模式 | 行为 | 用途 |
+| --- | --- | --- |
+| `tail_append` | 保留旧动作 buffer，仅追加新动作块最后一步 | 对齐 Jetson-PI 尾部补充基线 |
+| `replace_after_one_step` | 假设推理期间执行一步；清空旧 buffer，丢弃新块第 0 步，从第 1 步接管 | 更及时地让新视觉动作生效 |
+
+两种模式都属于实验选项。当前 `replace_after_one_step` 固定假设小脑请求耗时一个控制步，尚未根据实测延迟动态裁剪动作。
+
+## 🔧 环境安装
+
+### 运行要求
+
+| 项目 | 建议 |
+| --- | --- |
+| 操作系统 | Ubuntu 22.04 |
+| Python | 3.11 |
+| 训练框架 | JAX / Flax NNX |
+| GPU | 训练默认 `batch_size=16`，建议至少 48 GB 显存；显存不足时减小 batch |
+| 仿真 | LIBERO |
+
+### 克隆与安装
 
 ```bash
 git clone --recurse-submodules <this-repo-url>
-cd <repo>
+cd Jetson-PI-Vit
 git submodule update --init --recursive
-```
 
-### 2. Training environment (JAX)
-
-Install with [uv](https://docs.astral.sh/uv/):
-
-```bash
 export PYTHONNOUSERSITE=1
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 ```
 
-Pin versions are listed in `training_requirements.txt` (Python 3.11, JAX 0.5.3, etc.).
-
-Apply the transformers patch required for π₀.₅ PyTorch/JAX compatibility:
+Pi0.5 的 PyTorch/JAX 兼容补丁沿用上游安装方式：
 
 ```bash
-cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/
+cp -r ./src/openpi/models_pytorch/transformers_replace/* \
+  .venv/lib/python3.11/site-packages/transformers/
 ```
 
-### 3. LIBERO eval client (simulation)
-
-The policy **server** uses the training venv (`PY_SERVER`). The LIBERO **client** can use `examples/libero/.venv`:
+LIBERO 客户端使用独立环境：
 
 ```bash
 uv venv --python 3.11 examples/libero/.venv
 source examples/libero/.venv/bin/activate
 uv pip sync examples/libero/requirements.txt third_party/libero/requirements.txt \
-  --extra-index-url https://download.pytorch.org/whl/cu121 --index-strategy=unsafe-best-match
+  --extra-index-url https://download.pytorch.org/whl/cu121 \
+  --index-strategy=unsafe-best-match
 uv pip install -e packages/openpi-client
 uv pip install -e third_party/libero
 ```
 
-Eval-only dependencies are listed in `test_requirements.txt`.
+### 基础 checkpoint
 
-### 4. Paths and checkpoints
-
-#### Download checkpoints
-
-Pretrained **π₀.₅-LIBERO** + **future correction module** (LIBERO-spatial, step 65000) are hosted on:
-
-**Hugging Face: [diantoudefengshan/Jetson-PI-pi05](https://huggingface.co/diantoudefengshan/Jetson-PI-pi05)**
-
-**ModelScope: [zebinyang/Jetson-PI-pi05](https://www.modelscope.cn/models/zebinyang/Jetson-PI-pi05)**
-
+训练需要 Pi0.5-LIBERO 和上游 future correction module 作为基础权重。上游模型可从 [ModelScope](https://www.modelscope.cn/models/zebinyang/Jetson-PI-pi05) 或 [Hugging Face](https://huggingface.co/diantoudefengshan/Jetson-PI-pi05) 获取。
 
 ```bash
 pip install modelscope
-python -c "from modelscope import snapshot_download; snapshot_download('zebinyang/Jetson-PI-pi05', local_dir='./checkpoints/jetson-pi-pi05')"
-export PI0_CHECKPOINT=./checkpoints/jetson-pi-pi05/pi05_libero
-export WM=./checkpoints/jetson-pi-pi05/future_correction_module
+python -c "from modelscope import snapshot_download; snapshot_download('zebinyang/Jetson-PI-pi05', local_dir='./checkpoints/Pretrained')"
 ```
 
-The bundle contains two separate directories (`pi05_libero/`, `future_correction_module/`); do not merge their `params/` trees.
+基础目录应分别包含：
 
-Set these before training or evaluation:
-
-| Variable | Description |
-|----------|-------------|
-| `PI0_CHECKPOINT` | π₀.₅-LIBERO weights (local dir with `params/`). Use `pi05_libero/` from [ModelScope](https://www.modelscope.cn/models/zebinyang/Jetson-PI-pi05), or download upstream: `gs://openpi-assets/checkpoints/pi05_libero` |
-| `WM` | **Eval only.** Path to trained future correction module dir (must contain `params/`). Use `future_correction_module/` from [ModelScope](https://www.modelscope.cn/models/zebinyang/Jetson-PI-pi05) |
-| `OPENPI_LIBERO_LOCAL_DATASET_DIR` | LeRobot LIBERO dataset root (parquet + `meta/tasks.jsonl`) |
-| `PY` | Python for **training** (JAX venv) |
-| `PY_SERVER` | Python for **serve_policy** (must have JAX; often same as `PY`) |
-
-Example:
-
-```bash
-export PI0_CHECKPOINT=PATH/TO/CHECKPOINT/pi05_libero
-export OPENPI_LIBERO_LOCAL_DATASET_DIR=PATH/TO/DATASET/libero
-export PY=PATH/TO/PYTHON
-export PY_SERVER=PATH/TO/PYTHON
-export PYTHONNOUSERSITE=1
+```text
+checkpoints/Pretrained/
+├── pi05_libero/
+│   └── params/
+└── future_correction_module/
+    └── params/
 ```
 
----
+不要合并两个 `params/` 目录。
 
-## Training
+## 🧪 训练
 
-### Recipe (current default)
+当前主实验只执行 Stage 2 条件均值训练：
 
-Three-stage schedule on **π₀.₅-LIBERO**:
-
-| Stage | Steps | What is trained |
-|-------|-------|-----------------|
-| 1 | 30,000 | Action Expert + token reducer (`L_act`) |
-| 2 | 15,000 | Future correction module (`L_cond`, no logvar head) |
-| 3 | 55,000 | `L_cond` on future correction module (no reducer) + `L_act` on Pi0 AE + full LLM (μ detached) |
-
-Fixed handover **H = 10**, `max_delta_t = 10`, `action_encoder = transformer_block`.
-
-Checkpoints: `checkpoints/<EXP_NAME>/` (Orbax) and `checkpoints/<EXP_NAME>/world_model_step_<N>/`.
-
-### Launch
-
-Use the dedicated launcher (configure paths first):
-
-```bash
-cd PATH/TO/REPO
-export PI0_CHECKPOINT=PATH/TO/CHECKPOINT/pi05_libero
-export OPENPI_LIBERO_LOCAL_DATASET_DIR=PATH/TO/DATASET/libero
-export PY=PATH/TO/PYTHON
-export CUDA_VISIBLE_DEVICES=0
-
-bash scripts/train_wm_libero_spatial_four_stage.sh
+```text
+Stage 1 = 0
+Stage 2 = 15000
+Stage 3 = 0
+Stage 4 = 0
+visual_condition_kind = linear_joint
 ```
 
-Optional overrides:
+当前损失把 `log_var` 固定为零后复用高斯 NLL 实现，等价于 `0.5 * mean((target - mu)^2)`。`logvar_head` 不参与优化。
+
+### 训练参数范围
+
+| 类型 | 模块 |
+| --- | --- |
+| 训练 | ActionEncoder、ProprioEncoder、TimeEncoder、视觉 pooling、`LinearJointCondition`、FutureTokenBlocks、MeanHead |
+| 冻结 | Pi0、共享 SigLIP、PaliGemma LLM、Action Expert、TokenReducer、LogVarHead |
+| 排除 | linear-joint 不调用的旧 `u_proj/film` 和 residual 专用投影 |
+
+当前实现会从基础 WM checkpoint 加载形状兼容的既有参数，但不会执行旧 `u_proj/film` 到新 `LinearJointCondition` 的 legacy warm start；新增联合层按当前模型初始化器初始化并通过 Stage 2 训练。
+
+### 启动训练
 
 ```bash
-export STAGE1_STEPS=30000
+cd /path/to/Jetson-PI-Vit
+
+export PATH="$HOME/.local/bin:$PATH"
+export PI0_CHECKPOINT=/path/to/checkpoints/Pretrained/pi05_libero
+export WM_INIT_FROM_CHECKPOINT=/path/to/checkpoints/Pretrained/future_correction_module
+export OPENPI_LIBERO_LOCAL_DATASET_DIR=/path/to/datasets/libero
+export PY=/path/to/Jetson-PI-Vit/.venv/bin/python
+
+export STAGE1_STEPS=0
 export STAGE2_STEPS=15000
-export STAGE3_STEPS=55000
+export STAGE3_STEPS=0
 export BATCH_SIZE=16
-export NUM_WORKERS=4
-export EXP_NAME=my_wm_spatial_run
+export SAVE_INTERVAL=500
+export CUDA_VISIBLE_DEVICES=0
+
 bash scripts/train_wm_libero_spatial_four_stage.sh
 ```
 
-Logs: `logs/<EXP_NAME>.log`.
+输出位置：
 
----
+```text
+logs/<EXP_NAME>.log
+checkpoints/<EXP_NAME>/world_model_step_<N>/params/
+```
 
-## Evaluation
+训练脚本当前固定 `libero_task_index_min=30`、`libero_task_index_max=40`，对应 LIBERO-spatial 数据范围。修改任务范围时，训练和评估必须保持一致。
 
-Evaluation runs **serve_policy.py** (future correction module + π₀.₅ action expert) and **examples/libero/main.py** (LIBERO sim). Set `WM` to the trained future correction module checkpoint directory.
+## 📊 评估
 
-### Single run (FAAC + async action expert)
+### 每步小脑主实验
+
+评估时模型结构参数必须与训练 checkpoint 完全一致，尤其是 `linear_joint`、head 数量、GRU 隐藏维度和层数。
 
 ```bash
-cd PATH/TO/REPO
-export PI0_CHECKPOINT=PATH/TO/CHECKPOINT/pi05_libero
-export PY_SERVER=PATH/TO/PYTHON
-export WM=PATH/TO/future-correction-module
+cd /path/to/Jetson-PI-Vit
+
+export PATH="$HOME/.local/bin:$PATH"
+export PI0_CHECKPOINT=/path/to/checkpoints/Pretrained/pi05_libero
+export WM=/path/to/checkpoints/<EXP_NAME>/world_model_step_15000
+export PY_SERVER=/path/to/Jetson-PI-Vit/.venv/bin/python
+export PY=/path/to/Jetson-PI-Vit/examples/libero/.venv/bin/python
+
 export CUDA_VISIBLE_DEVICES=0
-export PORT=8000             # pick a free port
+export PORT=8004
+export LIBERO_WM_EVAL_NUM_TRIALS=50
+export LIBERO_WM_EVAL_TASK_SUITE=libero_spatial
+
+export WM_VISUAL_CONDITION_KIND=linear_joint
+export WM_ACTION_ENCODER_KIND=transformer_block
+export WM_NUM_REDUCER_HEADS=8
+export WM_NUM_FUTURE_HEADS=8
+export WM_GRU_HIDDEN_DIM=384
+export WM_GRU_NUM_LAYERS=3
+
+export LIBERO_WM_EVAL_PER_STEP_CEREBELLUM=1
+export LIBERO_WM_EVAL_PER_STEP_HANDOVER_MODE=replace_after_one_step
+export LIBERO_WM_EVAL_ADAPTIVE_KAPPA=0
+export AH=10
+export K=1
+export OVERLAP=9
+unset LIBERO_WM_EVAL_EXTRA_TYRO
 
 bash scripts/eval_wm_libero_spatial.sh
 ```
 
-Alternatively, if the checkpoint lives under `checkpoints/<EXP_NAME>/world_model_step_<N>/`:
+在 per-step 分支中，真正的“每步触发”由 `PerStepCerebellumBroker` 控制；`K/OVERLAP` 主要保留在统一脚本的命名和运行元数据中，动作接管行为由 `LIBERO_WM_EVAL_PER_STEP_HANDOVER_MODE` 决定。
+
+切换到 Jetson-PI 尾部补充方式只需修改：
 
 ```bash
-export EXP_NAME=<your_training_exp_name>
-export STEP=<N>
-bash scripts/eval_wm_libero_spatial.sh
+export LIBERO_WM_EVAL_PER_STEP_HANDOVER_MODE=tail_append
 ```
 
-Outputs under `logs/<run_dir>/`: `serve.log`, `client.log`, `run_meta.txt`, `videos/`.
+输出目录包含：
 
-Default: `libero_spatial`, **50 trials/task**, `H=10`, `K=9`, `overlap=1`.
+```text
+logs/<run_name>/
+├── run_meta.txt
+├── serve.log
+├── client.log
+└── videos/
+```
 
-### Adaptive multi-rollout (confidence-based scheduling)
+### 原 Jetson-PI 异步兼容路径
+
+不启用 `LIBERO_WM_EVAL_PER_STEP_CEREBELLUM` 时，评估脚本仍可运行原动作块触发流程。该路径可用于上游基线、`K=9` 实验以及旧的 adaptive-kappa/multi-rollout 对照；它与每步小脑 broker 是两个独立模式，不能同时启用。
+
+## ✅ 测试
+
+模型与客户端动作交接测试：
 
 ```bash
-export LIBERO_WM_EVAL_ADAPTIVE_KAPPA=1
-export LIBERO_WM_EVAL_KAPPA_DELTA=0.4
-bash scripts/eval_wm_libero_spatial.sh
+JAX_PLATFORMS=cpu .venv/bin/python -m pytest -q \
+  src/openpi/models/pi0_world_model_test.py
+
+.venv/bin/python -m pytest -q \
+  packages/openpi-client/src/openpi_client/action_chunk_broker_test.py
 ```
 
-### Other LIBERO suites
+在提交前至少运行：
 
 ```bash
-export LIBERO_WM_EVAL_TASK_SUITE=libero_object   # or libero_goal, libero_10
-bash scripts/eval_wm_libero_spatial.sh
+git diff --check
+bash -n scripts/train_wm_libero_spatial_four_stage.sh
+bash -n scripts/eval_wm_libero_spatial.sh
+bash -n scripts/libero_wm_eval_spatial_bundle_step_one_vit.sh
 ```
 
-### K-sweep (advanced)
+## ⚠️ 当前状态
 
-For sweeping trigger step `K` from 9 down to 1 with adaptive kappa:
+| 状态 | 内容 |
+| --- | --- |
+| 已打通 | `linear_joint` 前向、Stage 2 训练、checkpoint 保存/加载、LIBERO 每步异步小脑、两种动作交接 |
+| 正在验证 | 不同 WM checkpoint、快照更新频率、`tail_append` 与 `replace_after_one_step` 成功率 |
+| 当前限制 | 每步模式要求 `action_horizon=10`；动作前缀最大 10 步；替换模式固定一控制步延迟 |
+| 工程限制 | 后台大脑使用单 worker；若更新仍在运行，新一轮不会再排队启动另一份大脑任务 |
+| 实验范围 | 目前重点验证 LIBERO-spatial；真实机器人和其他 LIBERO suite 尚需系统实验 |
+| 尚未纳入 | 动态延迟对齐、动态动作裁剪、置信度门控、每步路径中的 multi-rollout |
 
-```bash
-export WM=PATH/TO/future-correction-module
-export PI0_CHECKPOINT=PATH/TO/CHECKPOINT/pi05_libero
-export PY_SERVER=PATH/TO/PYTHON
-export LIBERO_WM_EVAL_KAPPA_DELTA=0.4
-bash scripts/libero_wm_eval_spatial_k9to1_adaptive_kappa_low_replan_gpu2_kd0p4.sh
-```
+本 README 不复用上游 Jetson-PI 的结果表作为本分支结果。新的成功率、时延和消融表应在实验配置固定并完成复现后单独报告。
 
----
+## 🗂️ 关键代码
 
-## Troubleshooting
+| 路径 | 作用 |
+| --- | --- |
+| `src/openpi/models/pi0.py` | 共享 SigLIP 编码、从视觉 tokens 继续构造大脑前缀与 KV |
+| `src/openpi/models/pi0_world_model.py` | 最新视觉 pooling、`linear_joint`、未来条件 `mu` |
+| `src/openpi/training/world_model_training.py` | 最新视觉条件均值损失 |
+| `src/openpi/training/world_model_training_four_stage.py` | Stage 2 可训练参数过滤与 checkpoint 初始化 |
+| `src/openpi/policies/pi0_async_inference_policy.py` | H/KV 快照、已执行动作历史、每步小脑与后台大脑 |
+| `packages/openpi-client/src/openpi_client/action_chunk_broker.py` | 每步异步请求和动作交接 |
+| `examples/libero/main.py` | LIBERO 评估入口与 broker 选择 |
+| `scripts/serve_policy.py` | 模型结构参数和服务端加载 |
+| `scripts/train_wm_libero_spatial_four_stage.sh` | 当前训练入口 |
+| `scripts/eval_wm_libero_spatial.sh` | 当前评估入口 |
 
-| Issue | Fix |
-|-------|-----|
-| `ModuleNotFoundError: No module named 'jax'` in eval | Set `PY_SERVER` to the JAX training venv Python, not system Python |
-| OOM during training | Lower `BATCH_SIZE`, set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.85`, or `NUM_WORKERS=0` |
-| Missing `norm_stats` in eval | Point `--pi0-norm-checkpoint-dir` / `PI0_CHECKPOINT` to a tree containing `assets/physical-intelligence/libero/norm_stats.json` |
-| LIBERO EGL / display errors | Install `xvfb`; eval script falls back to `MUJOCO_GL=egl` if xvfb is missing |
-| Checkpoint save killed (no traceback) | First Orbax save can spike host RAM; see `docs/docker.md` and reduce save frequency for smoke tests |
+## 🔍 常见问题
 
----
+| 问题 | 处理方式 |
+| --- | --- |
+| `ModuleNotFoundError: No module named 'jax'` | `PY_SERVER` 必须指向 JAX 训练环境，而非系统 Python |
+| 加载 WM 时 shape mismatch | 检查 `WM_VISUAL_CONDITION_KIND`、head 数、GRU hidden dim 和层数是否与训练一致 |
+| `Per-step snapshot ... exceeds ... range` | 快照过旧，`delta_steps` 已超过训练动作前缀最大长度 10 |
+| per-step 与 adaptive flags 冲突 | 清除 `LIBERO_WM_EVAL_EXTRA_TYRO`，并保持 `LIBERO_WM_EVAL_ADAPTIVE_KAPPA=0` |
+| LIBERO EGL/display 错误 | 安装 `xvfb`；脚本在缺少 `xvfb-run` 时回退到 `MUJOCO_GL=egl` |
+| 训练显存不足 | 减小 `BATCH_SIZE`，必要时设置 `NUM_WORKERS=0` |
 
-## License
+## 🔗 上游、许可与引用
 
-See `LICENSE` and `LICENSE_GEMMA.txt`. LIBERO and upstream openpi components retain their respective licenses.
+本分支建立在 Jetson-PI 的 Foresight-Aligned Asynchronous Correction 代码与预训练模型之上[^1][^2]，并继续使用 OpenPI/Pi0.5[^3] 和 LIBERO 仿真基准[^4]。
 
-## Citation
+代码许可见 [`LICENSE`](LICENSE) 和 [`LICENSE_GEMMA.txt`](LICENSE_GEMMA.txt)。上游组件和第三方项目继续遵循各自许可证。
 
-If Jetson-PI helps your research, please cite our paper:
+若本仓库帮助了你的研究，请首先引用原 Jetson-PI 论文：
 
 ```bibtex
 @article{yang2026jetson,
@@ -335,6 +420,16 @@ If Jetson-PI helps your research, please cite our paper:
 }
 ```
 
-## Acknowledgments
+本分支尚未发布独立论文或正式引用条目；请勿把上游论文作者、机构或结果误写为本分支贡献。
 
-Jetson-PI builds on [OpenPI](https://github.com/Physical-Intelligence/openpi) and the π model family from [Physical Intelligence](https://www.physicalintelligence.company/), and uses [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) for simulation evaluation. The onboard inference engine is developed in [Jetson-PI-Edge](https://github.com/PKU-SEC-Lab/Jetson-PI-Edge), based on [llama.cpp](https://github.com/ggml-org/llama.cpp), with integration support for [FlashRT](https://github.com/flashrt-project/FlashRT).
+---
+
+_最后更新：2026-08-22 · 维护：华南理工大学研究人员_
+
+[^1]: Yang, Z. et al. (2026). "Jetson-PI: Towards Onboard Real-Time Robot Control via Foresight-Aligned Asynchronous Inference." _arXiv_. https://arxiv.org/abs/2607.12659
+
+[^2]: PKU-SEC-Lab. "Jetson-PI source code." _GitHub_. https://github.com/PKU-SEC-Lab/Jetson-PI
+
+[^3]: Physical Intelligence. "OpenPI: models and packages for robotics." _GitHub_. https://github.com/Physical-Intelligence/openpi
+
+[^4]: Lifelong Robot Learning. "LIBERO: Benchmarking Knowledge Transfer for Lifelong Robot Learning in Decision Making." _GitHub_. https://github.com/Lifelong-Robot-Learning/LIBERO
